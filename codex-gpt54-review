@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Iterable, Sequence
+
+
+DEFAULT_PROMPT = """Review the attached local changes as a senior peer reviewer.
+Focus on:
+- bugs and behavioral regressions
+- edge cases and failure modes
+- missing or weak tests
+- simpler or safer implementation choices
+
+Respond in Korean with short sections:
+1. 핵심 피드백
+2. 리스크
+3. 테스트 보강
+4. 바로 고칠 것
+"""
+
+DEFAULT_PROJECT_URL = "https://chatgpt.com/g/g-p-69afcec40f908191b65f5b13357d45cf-codexjeonyong/project"
+DEFAULT_OUTPUT_DIR = ".oracle-reviews"
+DEFAULT_DELIVERY = "cdp"
+DEFAULT_MODEL = "ChatGPT 5.4 Pro"
+DEFAULT_MODEL_STRATEGY = "select"
+WINDOWS_TEMP_DIR = Path("/mnt/c/Users/Administrator/AppData/Local/Temp")
+WINDOWS_RUNNER_DIR = Path("/mnt/c/Users/Administrator/AppData/Local/CodexChatGPTRunner")
+WINDOWS_NODE = "/mnt/c/Program Files/nodejs/node.exe"
+MAX_FILE_CHARS = 12000
+MAX_BUNDLE_CHARS = 100000
+
+
+def run_command(args: Sequence[str], cwd: Path) -> str:
+    result = subprocess.run(
+        list(args),
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def split_non_empty(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def is_reviewable_path(path: Path) -> bool:
+    return path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+
+
+def dedupe_paths(paths: Iterable[Path]) -> list[Path]:
+    seen: set[str] = set()
+    selected: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
+        key = str(resolved)
+        if key in seen or not resolved.exists() or not is_reviewable_path(resolved):
+            continue
+        seen.add(key)
+        selected.append(resolved)
+    return selected
+
+
+def detect_repo_root(start: Path) -> Path:
+    return Path(run_command(["git", "rev-parse", "--show-toplevel"], start))
+
+
+def detect_branch(repo_root: Path) -> str:
+    return run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_root)
+
+
+def gather_changed_files(repo_root: Path, *, include_untracked: bool) -> list[Path]:
+    staged = split_non_empty(run_command(["git", "diff", "--name-only", "--cached", "--diff-filter=ACMR"], repo_root))
+    unstaged = split_non_empty(run_command(["git", "diff", "--name-only", "--diff-filter=ACMR"], repo_root))
+    selected = [repo_root / path for path in [*staged, *unstaged]]
+    if include_untracked:
+        untracked = split_non_empty(run_command(["git", "ls-files", "--others", "--exclude-standard"], repo_root))
+        selected.extend(repo_root / path for path in untracked)
+    return dedupe_paths(selected)
+
+
+def build_diff_payload(repo_root: Path) -> str:
+    status_text = run_command(["git", "status", "--short"], repo_root)
+    staged_diff = run_command(["git", "diff", "--cached", "--find-renames", "--binary", "HEAD"], repo_root)
+    unstaged_diff = run_command(["git", "diff", "--find-renames", "--binary"], repo_root)
+    return (
+        "# Git Diff Review Payload\n\n"
+        "## Status\n"
+        "```text\n"
+        f"{status_text or '(clean working tree)'}\n"
+        "```\n\n"
+        "## Staged Diff\n"
+        "```diff\n"
+        f"{staged_diff or '(none)'}\n"
+        "```\n\n"
+        "## Unstaged Diff\n"
+        "```diff\n"
+        f"{unstaged_diff or '(none)'}\n"
+        "```\n"
+    )
+
+
+def build_context_markdown(
+    *,
+    repo_root: Path,
+    branch: str,
+    prompt_text: str,
+    selected_files: Sequence[Path],
+    status_text: str,
+    diff_stat: str,
+) -> str:
+    rel_files = []
+    for path in selected_files:
+        try:
+            rel_files.append(str(path.relative_to(repo_root)))
+        except ValueError:
+            rel_files.append(str(path))
+    files_block = "\n".join(f"- {path}" for path in rel_files) or "- (none)"
+    return f"""# Codex Review Context
+
+Repository: {repo_root.name}
+Path: {repo_root}
+Branch: {branch}
+
+## Requested Review
+{prompt_text.strip()}
+
+## Selected Files
+{files_block}
+
+## Git Status
+```text
+{status_text or "(clean working tree)"}
+```
+
+## Diff Stat
+```text
+{diff_stat or "(no diff stat available)"}
+```
+"""
+
+
+def create_temp_context(content: str) -> Path:
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".oracle-context.md", delete=False)
+    try:
+        handle.write(content)
+        handle.flush()
+        return Path(handle.name)
+    finally:
+        handle.close()
+
+
+def default_output_path(repo_root: Path) -> Path:
+    output_dir = repo_root / DEFAULT_OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"review-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+
+
+def read_file_excerpt(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if len(text) <= MAX_FILE_CHARS:
+        return text
+    return text[:MAX_FILE_CHARS] + "\n\n[truncated]\n"
+
+
+def build_bundle_text(
+    *,
+    repo_root: Path,
+    prompt_text: str,
+    context_text: str,
+    attachments: Sequence[Path],
+    begin_marker: str,
+    end_marker: str,
+) -> str:
+    parts = [
+        "You are reviewing a local coding change from Codex.",
+        "Return the final answer in Korean.",
+        "Wrap the full answer exactly between these markers:",
+        begin_marker,
+        end_marker,
+        "",
+        context_text.strip(),
+        "",
+        "## Attached Material",
+    ]
+    remaining = MAX_BUNDLE_CHARS
+    for attachment in attachments:
+        body = read_file_excerpt(attachment)
+        header = f"\n### {attachment.name}\n"
+        block = header + "```text\n" + body + "\n```\n"
+        if len(block) > remaining:
+            parts.append("\n[remaining attachments omitted due to bundle cap]\n")
+            break
+        parts.append(block)
+        remaining -= len(block)
+    parts.append("\n## Review Request\n")
+    parts.append(prompt_text.strip())
+    return "\n".join(parts)
+
+
+def write_windows_temp_file(name: str, content: str) -> Path:
+    WINDOWS_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    path = WINDOWS_TEMP_DIR / name
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def windows_temp_path(name: str) -> Path:
+    WINDOWS_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    return WINDOWS_TEMP_DIR / name
+
+
+def to_windows_path(path: Path) -> str:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return run_command(["wslpath", "-m", str(path)], Path.cwd())
+    return str(path)
+
+
+def decode_windows_bytes(data: bytes) -> str:
+    for encoding in ("utf-8", "cp949", "utf-8-sig"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def run_windows_powershell(script_text: str, *, script_name: str) -> subprocess.CompletedProcess[bytes]:
+    ps_script = write_windows_temp_file(script_name, script_text)
+    ps = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    try:
+        return subprocess.run(
+            [
+                ps,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                to_windows_path(ps_script),
+            ],
+            check=False,
+            capture_output=True,
+        )
+    finally:
+        try:
+            ps_script.unlink(missing_ok=True)
+        except TypeError:
+            if ps_script.exists():
+                ps_script.unlink()
+
+
+def run_windows_chatgpt(
+    *,
+    payload_path: Path,
+    output_path: Path,
+    project_url: str,
+    model_label: str,
+    model_strategy: str,
+    timeout_ms: int,
+    begin_marker: str,
+    end_marker: str,
+) -> subprocess.CompletedProcess[bytes]:
+    ps_script = Path("/home/mrcorp/Coding/Tools/호출기/chatgpt-windows-run.ps1")
+    ps = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    command = [
+        ps,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(ps_script),
+        "-PayloadPath",
+        to_windows_path(payload_path),
+        "-OutputPath",
+        to_windows_path(output_path),
+        "-ProjectUrl",
+        project_url,
+        "-ModelLabel",
+        model_label,
+        "-ModelStrategy",
+        model_strategy,
+        "-TimeoutMs",
+        str(timeout_ms),
+        "-BeginMarker",
+        begin_marker,
+        "-EndMarker",
+        end_marker,
+    ]
+    return subprocess.run(command, check=False, capture_output=True)
+
+
+def detect_windows_cdp_debug_url() -> str:
+    completed = run_windows_powershell(
+        script_name="codex-chatgpt-detect-cdp.ps1",
+        script_text=r"""
+$sessionPath = Join-Path $env:LOCALAPPDATA 'CodexChatGPTRunner\pinchtab-session.json'
+$profileName = ''
+if (Test-Path $sessionPath) {
+  try {
+    $session = Get-Content -Raw $sessionPath | ConvertFrom-Json
+    $profileName = [string]$session.profileName
+  } catch {
+    $profileName = ''
+  }
+}
+
+$chrome = @(Get-CimInstance Win32_Process | Where-Object {
+  $_.Name -eq 'chrome.exe' -and $_.CommandLine -match '--remote-debugging-port=\d+'
+})
+
+if ($profileName) {
+  $escaped = [regex]::Escape($profileName)
+  foreach ($proc in $chrome) {
+    if ($proc.CommandLine -match $escaped -and $proc.CommandLine -match '--remote-debugging-port=(\d+)') {
+      Write-Output ('http://127.0.0.1:' + $Matches[1])
+      exit 0
+    }
+  }
+}
+
+foreach ($proc in $chrome) {
+  if ($proc.CommandLine -match '\\\.pinchtab\\profiles\\instance-' -and $proc.CommandLine -match '--remote-debugging-port=(\d+)') {
+    Write-Output ('http://127.0.0.1:' + $Matches[1])
+    exit 0
+  }
+}
+
+Write-Error 'Could not find an active Chrome remote-debugging port for the current Pinchtab ChatGPT session.'
+exit 1
+""",
+    )
+    if completed.returncode != 0:
+        stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
+        stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
+        raise RuntimeError((stderr_text or stdout_text or "Failed to detect Chrome debug URL.").strip())
+    stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
+    debug_url = stdout_text.strip()
+    if not debug_url:
+        raise RuntimeError("Chrome debug URL detection returned an empty result.")
+    return debug_url
+
+
+def run_windows_cdp_chatgpt(
+    *,
+    payload_path: Path,
+    output_path: Path,
+    project_url: str,
+    model_label: str,
+    model_strategy: str,
+    timeout_ms: int,
+    begin_marker: str,
+    end_marker: str,
+    debug_url: str | None,
+    marker_suffix: str,
+) -> subprocess.CompletedProcess[bytes]:
+    resolved_debug_url = debug_url or detect_windows_cdp_debug_url()
+    driver_source = Path("/home/mrcorp/Coding/Tools/호출기/chatgpt-cdp-smoke.js").read_text(encoding="utf-8")
+    driver_path = write_windows_temp_file("chatgpt-cdp-driver.js", driver_source)
+    config_payload = json.dumps(
+        {
+            "debugUrl": resolved_debug_url,
+            "payloadPath": to_windows_path(payload_path),
+            "outputPath": to_windows_path(output_path),
+            "beginMarker": begin_marker,
+            "endMarker": end_marker,
+            "timeoutMs": timeout_ms,
+            "projectUrl": project_url,
+            "modelLabel": model_label,
+            "modelStrategy": model_strategy,
+        },
+        ensure_ascii=False,
+    )
+    config_path = write_windows_temp_file(f"codex-chatgpt-cdp-{marker_suffix}.json", config_payload)
+    try:
+        return subprocess.run(
+            [
+                WINDOWS_NODE,
+                to_windows_path(driver_path),
+                to_windows_path(config_path),
+            ],
+            check=False,
+            capture_output=True,
+        )
+    finally:
+        try:
+            config_path.unlink(missing_ok=True)
+        except TypeError:
+            if config_path.exists():
+                config_path.unlink()
+
+
+def copy_to_windows_clipboard(text: str) -> None:
+    payload_path = write_windows_temp_file("codex-chatgpt-manual-payload.txt", text)
+    ps = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    subprocess.run(
+        [
+            ps,
+            "-NoProfile",
+            "-Command",
+            f"Get-Content -Raw '{to_windows_path(payload_path)}' | Set-Clipboard",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def open_windows_browser(url: str) -> None:
+    if not url:
+        return
+    subprocess.run(
+        [
+            "/mnt/c/Windows/System32/cmd.exe",
+            "/c",
+            "start",
+            "",
+            url,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Use a Windows ChatGPT browser session as a secondary reviewer for the current repo."
+    )
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="Review instruction for ChatGPT.")
+    parser.add_argument("--repo", default=".", help="Path inside the target git repository.")
+    parser.add_argument("--file", action="append", default=[], dest="extra_files", help="Extra file to attach.")
+    parser.add_argument("--include-untracked", action="store_true", help="Also attach untracked files.")
+    parser.add_argument("--no-changed-files", action="store_true", help="Do not auto-attach git changed files.")
+    parser.add_argument(
+        "--mode",
+        default="diff",
+        choices=["diff", "files", "hybrid"],
+        help="Attachment strategy: diff only, files only, or both.",
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Visible model label in ChatGPT.")
+    parser.add_argument(
+        "--model-strategy",
+        default=DEFAULT_MODEL_STRATEGY,
+        choices=["select", "current", "ignore"],
+        help="How the Windows runner should control the ChatGPT model picker.",
+    )
+    parser.add_argument(
+        "--delivery",
+        default=DEFAULT_DELIVERY,
+        choices=["manual", "pinchtab", "cdp"],
+        help="How to deliver the review prompt: manual browser paste, Pinchtab automation, or Chrome DevTools automation.",
+    )
+    parser.add_argument("--cdp-debug-url", default=None, help="Override the Chrome DevTools endpoint for `--delivery cdp`.")
+    parser.add_argument("--project-url", default=DEFAULT_PROJECT_URL, help="ChatGPT project URL for browser runs.")
+    parser.add_argument("--no-project-url", action="store_true", help="Do not force a ChatGPT project URL.")
+    parser.add_argument("--write-output", default=None, help="Save the final assistant message to this file.")
+    parser.add_argument("--timeout-ms", type=int, default=900000, help="Wait budget for the ChatGPT answer.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without sending.")
+    parser.add_argument("--render", action="store_true", help="Render the assembled prompt bundle.")
+    return parser.parse_args(argv)
+
+
+def print_wsl_help() -> None:
+    print("")
+    print("Browser hint:")
+    print("- First run `chatgpt-browser-up`, keep that ChatGPT browser window open, and sign in there once if needed.")
+    print("- CDP mode can verify or switch the ChatGPT model on the `Codex전용` project page.")
+    print("- Pinchtab mode can only reuse the current model unless you switch it manually first.")
+    print("- Then rerun `codex-gpt54-review`.")
+
+
+def print_manual_help(project_url: str, prompt_artifact: Path) -> None:
+    print("")
+    print("Manual mode:")
+    print("- Opened the ChatGPT project in your normal Windows browser.")
+    print("- Copied the assembled review prompt to the Windows clipboard.")
+    print(f"- Prompt artifact: {prompt_artifact}")
+    if project_url:
+        print(f"- Browser target: {project_url}")
+    print("- Paste in ChatGPT and send from the normal logged-in browser.")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    repo_root = detect_repo_root(Path(args.repo).resolve())
+    branch = detect_branch(repo_root)
+
+    selected_files: list[Path] = []
+    if args.mode in {"files", "hybrid"} and not args.no_changed_files:
+        selected_files.extend(gather_changed_files(repo_root, include_untracked=args.include_untracked))
+    selected_files.extend(Path(path).resolve() for path in args.extra_files)
+    selected_files = dedupe_paths(selected_files)
+
+    attachments: list[Path] = []
+    temp_paths: list[Path] = []
+
+    if args.mode in {"diff", "hybrid"}:
+        diff_file = create_temp_context(build_diff_payload(repo_root))
+        attachments.append(diff_file)
+        temp_paths.append(diff_file)
+
+    if selected_files:
+        attachments.extend(selected_files)
+
+    if not attachments:
+        print("No attachments selected. Modify tracked files first or pass --file <path>.", file=sys.stderr)
+        return 1
+
+    status_text = run_command(["git", "status", "--short"], repo_root)
+    diff_stat = run_command(["git", "diff", "--stat", "HEAD"], repo_root)
+    context_file = create_temp_context(
+        build_context_markdown(
+            repo_root=repo_root,
+            branch=branch,
+            prompt_text=args.prompt,
+            selected_files=selected_files,
+            status_text=status_text,
+            diff_stat=diff_stat,
+        )
+    )
+    temp_paths.append(context_file)
+
+    marker_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+    begin_marker = f"BEGIN_CDX_REVIEW_{marker_suffix}"
+    end_marker = f"END_CDX_REVIEW_{marker_suffix}"
+    bundle_text = build_bundle_text(
+        repo_root=repo_root,
+        prompt_text=args.prompt,
+        context_text=context_file.read_text(encoding="utf-8"),
+        attachments=attachments,
+        begin_marker=begin_marker,
+        end_marker=end_marker,
+    )
+    write_output = Path(args.write_output).resolve() if args.write_output else default_output_path(repo_root)
+    prompt_artifact = write_output.with_suffix(".prompt.md")
+    print(f"Output file: {write_output}")
+    if args.render or args.dry_run:
+        print(bundle_text)
+        if args.dry_run:
+            for temp_path in temp_paths:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+            return 0
+
+    prompt_artifact.parent.mkdir(parents=True, exist_ok=True)
+    prompt_artifact.write_text(bundle_text, encoding="utf-8")
+
+    if args.delivery == "manual":
+        copy_to_windows_clipboard(bundle_text)
+        if not args.no_project_url:
+            open_windows_browser(args.project_url)
+        print_manual_help("" if args.no_project_url else args.project_url, prompt_artifact)
+        for temp_path in temp_paths:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+        return 0
+
+    if args.delivery == "pinchtab" and args.model_strategy == "select":
+        print(
+            "Pinchtab delivery cannot automate ChatGPT model switching yet. Use `--delivery cdp` or set `--model-strategy current`.",
+            file=sys.stderr,
+        )
+        for temp_path in temp_paths:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+        return 2
+
+    payload_path = write_windows_temp_file(f"codex-chatgpt-payload-{marker_suffix}.txt", bundle_text)
+    windows_output_path = windows_temp_path(f"codex-chatgpt-output-{marker_suffix}.md")
+    try:
+        if args.delivery == "cdp":
+            completed = run_windows_cdp_chatgpt(
+                payload_path=payload_path,
+                output_path=windows_output_path,
+                project_url="" if args.no_project_url else args.project_url,
+                model_label=args.model,
+                model_strategy=args.model_strategy,
+                timeout_ms=args.timeout_ms,
+                begin_marker=begin_marker,
+                end_marker=end_marker,
+                debug_url=args.cdp_debug_url,
+                marker_suffix=marker_suffix,
+            )
+        else:
+            completed = run_windows_chatgpt(
+                payload_path=payload_path,
+                output_path=windows_output_path,
+                project_url="" if args.no_project_url else args.project_url,
+                model_label=args.model,
+                model_strategy=args.model_strategy,
+                timeout_ms=args.timeout_ms,
+                begin_marker=begin_marker,
+                end_marker=end_marker,
+            )
+        completed_code = completed.returncode
+        stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
+        stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
+        if stdout_text:
+            print(stdout_text.strip())
+        if stderr_text:
+            print(stderr_text.strip(), file=sys.stderr)
+        if completed_code == 0:
+            review_text = ""
+            for _ in range(10):
+                if windows_output_path.exists() and windows_output_path.stat().st_size > 0:
+                    review_text = windows_output_path.read_text(encoding="utf-8", errors="replace")
+                    break
+                time.sleep(0.5)
+            if not review_text.strip():
+                review_text = stdout_text
+            if review_text is not None:
+                write_output.parent.mkdir(parents=True, exist_ok=True)
+                write_output.write_text(review_text, encoding="utf-8")
+    finally:
+        try:
+            payload_path.unlink(missing_ok=True)
+        except TypeError:
+            if payload_path.exists():
+                payload_path.unlink()
+        try:
+            windows_output_path.unlink(missing_ok=True)
+        except TypeError:
+            if windows_output_path.exists():
+                windows_output_path.unlink()
+        for temp_path in temp_paths:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+
+    if completed_code != 0 and os.environ.get("WSL_DISTRO_NAME"):
+        print_wsl_help()
+    return completed_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

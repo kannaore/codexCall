@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PS="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+RUNNER="/home/mrcorp/Coding/Tools/호출기/chatgpt-windows-run.ps1"
+
+"$PS" -NoProfile -ExecutionPolicy Bypass -File "$RUNNER" -StatusOnly

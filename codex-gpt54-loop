@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Sequence
+
+
+DEFAULT_OUTPUT_DIR = ".oracle-reviews"
+DEFAULT_MAX_ROUNDS = 3
+DEFAULT_REVIEW_MODEL = "ChatGPT 5.4 Pro"
+DEFAULT_REVIEW_MODEL_STRATEGY = "select"
+DEFAULT_REVIEW_DELIVERY = "cdp"
+DEFAULT_REVIEW_MODE = "diff"
+DEFAULT_REVIEW_TIMEOUT_MS = 900000
+
+
+@dataclass
+class ReviewDecision:
+    verdict: str
+    summary: str
+    must_fix: list[str]
+    risks: list[str]
+    tests: list[str]
+    follow_up_prompt: str
+    raw: dict[str, Any]
+
+
+def run_command(
+    args: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(args),
+        cwd=str(cwd) if cwd else None,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def detect_repo_root(start: Path) -> Path:
+    result = run_command(["git", "rev-parse", "--show-toplevel"], cwd=start)
+    if result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or "Failed to detect git repository.")
+    return Path(result.stdout.strip()).resolve()
+
+
+def read_task(task_arg: str | None) -> str:
+    if task_arg == "-":
+        return sys.stdin.read().strip()
+    if task_arg:
+        return task_arg.strip()
+    return ""
+
+
+def ensure_text_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value is None:
+        return []
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+
+    candidates = [stripped]
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(stripped[start : end + 1])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            loaded = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(loaded, dict):
+            return loaded
+
+    raise ValueError("Review output was not valid JSON.")
+
+
+def parse_review_decision(text: str) -> ReviewDecision:
+    payload = extract_json_object(text)
+    verdict = str(payload.get("verdict", "")).strip().lower()
+    if verdict not in {"pass", "revise"}:
+        raise ValueError("Review verdict must be 'pass' or 'revise'.")
+    return ReviewDecision(
+        verdict=verdict,
+        summary=str(payload.get("summary", "")).strip(),
+        must_fix=ensure_text_list(payload.get("must_fix")),
+        risks=ensure_text_list(payload.get("risks")),
+        tests=ensure_text_list(payload.get("tests")),
+        follow_up_prompt=str(payload.get("follow_up_prompt", "")).strip(),
+        raw=payload,
+    )
+
+
+def parse_thread_id(jsonl_text: str) -> str:
+    for line in jsonl_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("type") == "thread.started":
+            thread_id = payload.get("thread_id")
+            if thread_id:
+                return str(thread_id)
+    raise ValueError("Codex session id was not found in JSON output.")
+
+
+def has_repo_changes(repo_root: Path, *, session_dir: Path | None = None) -> bool:
+    result = run_command(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=repo_root)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git status failed.")
+    return any(
+        is_reviewable_status_path(path, session_dir=session_dir)
+        for _status, path in iter_status_entries(repo_root, result.stdout)
+    )
+
+
+def has_untracked_files(repo_root: Path, *, session_dir: Path | None = None) -> bool:
+    result = run_command(["git", "ls-files", "--others", "--exclude-standard"], cwd=repo_root)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git ls-files failed.")
+    for line in result.stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if is_reviewable_status_path(repo_root / text, session_dir=session_dir):
+            return True
+    return False
+
+
+def iter_status_entries(repo_root: Path, status_text: str) -> list[tuple[str, Path]]:
+    entries: list[tuple[str, Path]] = []
+    for raw_line in status_text.splitlines():
+        if not raw_line.strip():
+            continue
+        status = raw_line[:2]
+        path_text = raw_line[3:].strip()
+        if " -> " in path_text:
+            path_text = path_text.split(" -> ", 1)[1].strip()
+        entries.append((status, repo_root / path_text))
+    return entries
+
+
+def is_reviewable_status_path(path: Path, *, session_dir: Path | None) -> bool:
+    if session_dir is not None:
+        try:
+            path.relative_to(session_dir)
+            return False
+        except ValueError:
+            pass
+    return DEFAULT_OUTPUT_DIR not in path.parts and "__pycache__" not in path.parts and path.suffix != ".pyc"
+
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def build_review_prompt(task: str, note: str) -> str:
+    sections = [
+        "You are the secondary reviewer in a recursive Codex improvement loop.",
+        "Judge only the attached local changes and their likely behavior.",
+        "",
+        "Original user task:",
+        task.strip(),
+        "",
+        "Return JSON only with this schema:",
+        "{",
+        '  "verdict": "pass" | "revise",',
+        '  "summary": "string",',
+        '  "must_fix": ["string"],',
+        '  "risks": ["string"],',
+        '  "tests": ["string"],',
+        '  "follow_up_prompt": "string"',
+        "}",
+        "",
+        "Rules:",
+        "- Use verdict 'pass' only when there are no material bugs, regressions, or missing tests left to address.",
+        "- Minor style nits alone should still be 'pass'.",
+        "- Ground every claim in the attached diff/files. Do not invent missing context.",
+        "- Keep every string concise and in Korean.",
+        "- `must_fix`, `risks`, and `tests` should each contain up to 5 items.",
+        "- `follow_up_prompt` should be empty when verdict is 'pass'.",
+        "- `follow_up_prompt` should be a compact instruction Codex can act on immediately when verdict is 'revise'.",
+        "- Do not wrap the JSON in markdown fences.",
+    ]
+    if note.strip():
+        sections.extend(["", "Extra review emphasis:", note.strip()])
+    return "\n".join(sections)
+
+
+def bullet_block(title: str, items: Sequence[str]) -> str:
+    if not items:
+        return ""
+    return title + "\n" + "\n".join(f"- {item}" for item in items)
+
+
+def build_follow_up_prompt(review: ReviewDecision) -> str:
+    parts = [
+        "다음은 웹 ChatGPT의 코드 리뷰 결과다. 실제 코드와 대조해서 타당한 지적만 반영하고 수정해라.",
+    ]
+    if review.summary:
+        parts.append(f"요약: {review.summary}")
+    must_fix_block = bullet_block("반드시 고칠 것:", review.must_fix)
+    if must_fix_block:
+        parts.append(must_fix_block)
+    risk_block = bullet_block("추가 리스크:", review.risks)
+    if risk_block:
+        parts.append(risk_block)
+    test_block = bullet_block("보강할 테스트:", review.tests)
+    if test_block:
+        parts.append(test_block)
+    if review.follow_up_prompt:
+        parts.append("리뷰어 후속 지시:\n" + review.follow_up_prompt)
+    parts.append("수정 후에는 무엇을 바꿨고 어떤 테스트를 보강했는지 짧게 보고해라.")
+    return "\n\n".join(parts)
+
+
+def print_review_summary(round_index: int, review: ReviewDecision, review_path: Path) -> None:
+    print(f"[round {round_index}] review verdict: {review.verdict}")
+    if review.summary:
+        print(f"  summary: {review.summary}")
+    if review.must_fix:
+        print("  must_fix:")
+        for item in review.must_fix:
+            print(f"    - {item}")
+    if review.tests:
+        print("  tests:")
+        for item in review.tests:
+            print(f"    - {item}")
+    if review.risks:
+        print("  risks:")
+        for item in review.risks:
+            print(f"    - {item}")
+    print(f"  saved: {review_path}")
+
+
+def confirm_manual_continue() -> bool:
+    try:
+        answer = input("Send this review back to Codex for another round? [Y/n]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"", "y", "yes"}
+
+
+def build_codex_command(
+    *,
+    repo_root: Path,
+    thread_id: str | None,
+    message_path: Path,
+    args: argparse.Namespace,
+) -> list[str]:
+    resume_existing = bool(thread_id or args.codex_session_id or args.codex_resume_last)
+    if resume_existing:
+        command = ["codex", "exec", "resume", "--json", "-o", str(message_path)]
+    else:
+        command = ["codex", "exec", "--json", "-C", str(repo_root), "-o", str(message_path)]
+
+    if args.codex_model:
+        command.extend(["-m", args.codex_model])
+    if args.codex_profile:
+        command.extend(["-p", args.codex_profile])
+    if args.codex_full_auto:
+        command.append("--full-auto")
+    if args.codex_bypass_approvals:
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+
+    if resume_existing:
+        if thread_id:
+            command.extend([thread_id, "-"])
+        elif args.codex_session_id:
+            command.extend([args.codex_session_id, "-"])
+        else:
+            command.extend(["--last", "-"])
+    else:
+        command.append("-")
+    return command
+
+
+def run_codex_round(
+    *,
+    repo_root: Path,
+    round_index: int,
+    thread_id: str | None,
+    prompt: str,
+    session_dir: Path,
+    args: argparse.Namespace,
+) -> str:
+    message_path = session_dir / f"round-{round_index:02d}.codex.md"
+    stdout_path = session_dir / f"round-{round_index:02d}.codex.jsonl"
+    stderr_path = session_dir / f"round-{round_index:02d}.codex.stderr.log"
+    command = build_codex_command(
+        repo_root=repo_root,
+        thread_id=thread_id,
+        message_path=message_path,
+        args=args,
+    )
+    result = run_command(command, cwd=repo_root, input_text=prompt)
+    write_text(stdout_path, result.stdout)
+    write_text(stderr_path, result.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Codex round {round_index} failed. See {stdout_path} and {stderr_path}."
+        )
+    next_thread_id = parse_thread_id(result.stdout)
+    print(f"[round {round_index}] codex complete. thread={next_thread_id}")
+    return next_thread_id
+
+
+def review_command_path() -> Path:
+    return Path(__file__).with_name("codex-gpt54-review")
+
+
+def run_review_round(
+    *,
+    repo_root: Path,
+    round_index: int,
+    task: str,
+    session_dir: Path,
+    args: argparse.Namespace,
+) -> tuple[ReviewDecision, Path]:
+    review_path = session_dir / f"round-{round_index:02d}.review.json"
+    stdout_path = session_dir / f"round-{round_index:02d}.review.stdout.log"
+    stderr_path = session_dir / f"round-{round_index:02d}.review.stderr.log"
+    review_mode = args.review_mode
+    include_untracked = args.include_untracked
+    if review_mode == "diff" and has_untracked_files(repo_root, session_dir=session_dir):
+        review_mode = "hybrid"
+        include_untracked = True
+        print(f"[round {round_index}] untracked files detected; escalating review mode to hybrid with untracked files.")
+    command = [
+        str(review_command_path()),
+        "--repo",
+        str(repo_root),
+        "--prompt",
+        build_review_prompt(task, args.review_note),
+        "--write-output",
+        str(review_path),
+        "--delivery",
+        args.review_delivery,
+        "--mode",
+        review_mode,
+        "--model",
+        args.review_model,
+        "--model-strategy",
+        args.review_model_strategy,
+        "--timeout-ms",
+        str(args.review_timeout_ms),
+    ]
+    if args.cdp_debug_url:
+        command.extend(["--cdp-debug-url", args.cdp_debug_url])
+    if args.no_project_url:
+        command.append("--no-project-url")
+    elif args.project_url:
+        command.extend(["--project-url", args.project_url])
+    if include_untracked:
+        command.append("--include-untracked")
+    for path in args.review_files:
+        command.extend(["--file", path])
+
+    result = run_command(command, cwd=repo_root)
+    write_text(stdout_path, result.stdout)
+    write_text(stderr_path, result.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Review round {round_index} failed. See {stdout_path} and {stderr_path}."
+        )
+    review_text = review_path.read_text(encoding="utf-8", errors="replace")
+    review = parse_review_decision(review_text)
+    print_review_summary(round_index, review, review_path)
+    return review, review_path
+
+
+def default_session_dir(repo_root: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return repo_root / DEFAULT_OUTPUT_DIR / f"loop-{stamp}"
+
+
+def write_manifest(path: Path, payload: dict[str, Any]) -> None:
+    write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run a recursive Codex -> ChatGPT web review -> Codex improvement loop."
+    )
+    parser.add_argument("task", nargs="?", help="Initial Codex task. Use '-' to read from stdin.")
+    parser.add_argument("--repo", default=".", help="Path inside the target git repository.")
+    parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="Maximum Codex/review rounds.")
+    parser.add_argument(
+        "--feedback-mode",
+        choices=["auto", "manual"],
+        default="auto",
+        help="Automatically feed review feedback back into Codex, or pause each round for confirmation.",
+    )
+    parser.add_argument("--session-dir", default=None, help="Directory for loop artifacts and logs.")
+    parser.add_argument("--codex-model", default=None, help="Model passed to `codex exec`.")
+    parser.add_argument("--codex-profile", default=None, help="Config profile passed to `codex exec`.")
+    parser.add_argument("--codex-full-auto", action="store_true", help="Pass `--full-auto` to Codex.")
+    parser.add_argument(
+        "--codex-bypass-approvals",
+        action="store_true",
+        help="Pass `--dangerously-bypass-approvals-and-sandbox` to Codex.",
+    )
+    parser.add_argument("--codex-session-id", default=None, help="Resume an existing Codex session id instead of starting a new session.")
+    parser.add_argument("--codex-resume-last", action="store_true", help="Resume the most recent recorded Codex session instead of starting a new session.")
+    parser.add_argument("--review-model", default=DEFAULT_REVIEW_MODEL, help="Visible ChatGPT model label.")
+    parser.add_argument(
+        "--review-model-strategy",
+        default=DEFAULT_REVIEW_MODEL_STRATEGY,
+        choices=["select", "current", "ignore"],
+        help="How the ChatGPT web runner should handle the model picker.",
+    )
+    parser.add_argument(
+        "--review-delivery",
+        default=DEFAULT_REVIEW_DELIVERY,
+        choices=["manual", "pinchtab", "cdp"],
+        help="How to deliver the review prompt to ChatGPT.",
+    )
+    parser.add_argument("--cdp-debug-url", default=None, help="Override the Chrome DevTools endpoint when using `--review-delivery cdp`.")
+    parser.add_argument(
+        "--review-mode",
+        default=DEFAULT_REVIEW_MODE,
+        choices=["diff", "files", "hybrid"],
+        help="Attachment mode forwarded to `codex-gpt54-review`.",
+    )
+    parser.add_argument(
+        "--review-timeout-ms",
+        type=int,
+        default=DEFAULT_REVIEW_TIMEOUT_MS,
+        help="Timeout passed to the ChatGPT review runner.",
+    )
+    parser.add_argument("--review-file", action="append", default=[], dest="review_files", help="Extra file to attach to every review round.")
+    parser.add_argument("--include-untracked", action="store_true", help="Include untracked files in review rounds.")
+    parser.add_argument("--project-url", default=None, help="Override the ChatGPT project URL for review rounds.")
+    parser.add_argument("--no-project-url", action="store_true", help="Do not force a ChatGPT project URL during review.")
+    parser.add_argument("--review-note", default="", help="Extra review emphasis appended to the structured review prompt.")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    if args.max_rounds < 1:
+        print("--max-rounds must be at least 1.", file=sys.stderr)
+        return 2
+    if args.codex_full_auto and args.codex_bypass_approvals:
+        print("Choose either --codex-full-auto or --codex-bypass-approvals, not both.", file=sys.stderr)
+        return 2
+    if args.codex_session_id and args.codex_resume_last:
+        print("Choose either --codex-session-id or --codex-resume-last, not both.", file=sys.stderr)
+        return 2
+
+    task = read_task(args.task)
+    if not task:
+        print("An initial task is required. Pass it as an argument or via stdin with '-'.", file=sys.stderr)
+        return 2
+
+    repo_root = detect_repo_root(Path(args.repo).resolve())
+    session_dir = Path(args.session_dir).resolve() if args.session_dir else default_session_dir(repo_root)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = session_dir / "manifest.json"
+
+    manifest: dict[str, Any] = {
+        "repo_root": str(repo_root),
+        "task": task,
+        "feedback_mode": args.feedback_mode,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "status": "running",
+        "thread_id": None,
+        "initial_session_id": args.codex_session_id,
+        "resume_last": args.codex_resume_last,
+        "rounds": [],
+    }
+    write_manifest(manifest_path, manifest)
+
+    thread_id: str | None = None
+    next_prompt = task
+
+    try:
+        for round_index in range(1, args.max_rounds + 1):
+            print(f"[round {round_index}/{args.max_rounds}] running Codex...")
+            thread_id = run_codex_round(
+                repo_root=repo_root,
+                round_index=round_index,
+                thread_id=thread_id,
+                prompt=next_prompt,
+                session_dir=session_dir,
+                args=args,
+            )
+            manifest["thread_id"] = thread_id
+
+            round_record: dict[str, Any] = {
+                "round": round_index,
+                "codex_message": str(session_dir / f"round-{round_index:02d}.codex.md"),
+                "codex_jsonl": str(session_dir / f"round-{round_index:02d}.codex.jsonl"),
+                "codex_stderr": str(session_dir / f"round-{round_index:02d}.codex.stderr.log"),
+            }
+            manifest["rounds"].append(round_record)
+            write_manifest(manifest_path, manifest)
+
+            if not has_repo_changes(repo_root, session_dir=session_dir):
+                round_record["status"] = "no_changes"
+                manifest["status"] = "stopped-no-changes"
+                print(f"[round {round_index}] no git changes detected after Codex. Stopping before review.")
+                break
+
+            print(f"[round {round_index}/{args.max_rounds}] running ChatGPT review...")
+            review, review_path = run_review_round(
+                repo_root=repo_root,
+                round_index=round_index,
+                task=task,
+                session_dir=session_dir,
+                args=args,
+            )
+            round_record.update(
+                {
+                    "status": review.verdict,
+                    "review_path": str(review_path),
+                    "review_stdout": str(session_dir / f"round-{round_index:02d}.review.stdout.log"),
+                    "review_stderr": str(session_dir / f"round-{round_index:02d}.review.stderr.log"),
+                    "review_summary": review.summary,
+                    "must_fix": review.must_fix,
+                    "risks": review.risks,
+                    "tests": review.tests,
+                }
+            )
+            write_manifest(manifest_path, manifest)
+
+            if review.verdict == "pass":
+                manifest["status"] = "passed"
+                print(f"[round {round_index}] reviewer passed the changes.")
+                break
+
+            if round_index >= args.max_rounds:
+                manifest["status"] = "max-rounds"
+                print(f"[round {round_index}] max rounds reached with remaining review items.")
+                break
+
+            if args.feedback_mode == "manual" and not confirm_manual_continue():
+                manifest["status"] = "manual-stop"
+                print(f"[round {round_index}] stopped by user before sending follow-up to Codex.")
+                break
+
+            next_prompt = build_follow_up_prompt(review)
+        else:
+            manifest["status"] = "max-rounds"
+    except Exception as exc:  # noqa: BLE001
+        manifest["status"] = "failed"
+        manifest["error"] = str(exc)
+        write_manifest(manifest_path, manifest)
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    write_manifest(manifest_path, manifest)
+    print(f"Session dir: {session_dir}")
+    print(f"Manifest: {manifest_path}")
+    if manifest["thread_id"]:
+        print(f"Codex thread: {manifest['thread_id']}")
+
+    if manifest["status"] == "passed":
+        return 0
+    if manifest["status"] in {"manual-stop", "stopped-no-changes"}:
+        return 0
+    if manifest["status"] == "max-rounds":
+        return 3
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

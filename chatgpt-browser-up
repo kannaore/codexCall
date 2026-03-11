@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PS="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+RUNNER="/home/mrcorp/Coding/Tools/호출기/chatgpt-windows-run.ps1"
+PROJECT_URL="https://chatgpt.com/g/g-p-69afcec40f908191b65f5b13357d45cf-codexjeonyong/project"
+
+"$PS" -NoProfile -ExecutionPolicy Bypass -File "$RUNNER" -BootstrapLogin -ProjectUrl "$PROJECT_URL"
