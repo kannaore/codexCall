@@ -1,0 +1,107 @@
+mrhc@EBO91GY#_elFvKoQz*?HtVwn$jO>8u$cuG
+zq~;)(Er*<JP;L?RQ)Z6xlz@Rnnxp)_%f#Rqc@*1@_mcMbTFRfqxAOgTdv7ba%YvC1
+zy&~+H<jIj_lZnSDhDN+w(fCbrKiN)88d4otB3sgXXna0t>+8aPa;DFNV@j^C3LE4=
+zvIzw2C;ow2{1(|fFvQ3{^7p_3T@3tjvSq2?E>5bW(PH7+hB#Y8{QINdcbvLu#HLi
+zG;xJ*EyOvrNdGB_+eWYH&=BrWE)3mcDpig%gl5dHJ7(_<v-d>B_h#>HbNJ5(^{8at
+z9arTISLGiFi~bpp?*p=WbQvkk2*c%uQ3bzNae|uvDIUrQQg0DHY{lkqN|1%nj*~A
+zqlOHWpcUHY-2K3sfA%OevW!FA*p2vlZiN*1wLzGs3%*Dfdv-WCO5C-vvrz(1qNOT
+z{wYRo3G-8x8dqcBu*OT|RzE*o?ZfaB#2aLGIwZA5xanmYN8}Cj_16O&^<NKR;Q8zZ
+zSqU7RHsDc3eZSs_2bJoh3o3*m*x7zCuhIXK99E*=WH3HV7EgEtZRH~n8wE2)-k7MT
+zf*+q~!v~b#CVs_K(A-&%@Ge9Tfk}Z$6aBf%G;jLcA>2zgpYO%{l}qQbL|s>IY%I~b
+zmcUNG&{$&_9UXRkUUIkZf>FX;Jus2FisKQtti$1&@Dv=Unac}D{jZ|56X$#ZOm9B
+z#-U#%kIDn6Iz&;gVG)uXszE~|ph-hBa+IhR4XsGDtHl}$$mUT+4J9PHRhx!(B$TNR
+z4V}pDQe7IBAZM9cs$m(jIb5n+<9SH8aMq*YW>N;G9D{WMWvQA4GmKhpN{wKbeL
+j7{{cc8OE__XoZ7|H5A}rQ9}vo+_N^o*)&Vaf86vBPNxDl
+
+diff --git a/codex-gpt54-review b/codex-gpt54-review
+index 44e2a25..406123f 100755
+--- a/codex-gpt54-review
++++ b/codex-gpt54-review
+@@ -614,19 +614,6 @@ def run_windows_cdp_chatgpt(
+             capture_output=True,
+         )
+     finally:
+-        for _candidate, process, payload_path, config_path in running:
+-            if process.poll() is None:
+-                process.terminate()
+-                try:
+-                    process.wait(timeout=5)
+-                except subprocess.TimeoutExpired:
+-                    process.kill()
+-            for temp_path in (payload_path, config_path):
+-                try:
+-                    temp_path.unlink(missing_ok=True)
+-                except TypeError:
+-                    if temp_path.exists():
+-                        temp_path.unlink()
+         try:
+             driver_path.unlink(missing_ok=True)
+         except TypeError:
+@@ -789,6 +776,19 @@ def run_windows_cdp_chatgpt_fanout(
+                     config_path.unlink()
+         return completed_candidates
+     finally:
++        for _candidate, process, payload_path, config_path in running:
++            if process.poll() is None:
++                process.terminate()
++                try:
++                    process.wait(timeout=5)
++                except subprocess.TimeoutExpired:
++                    process.kill()
++            for temp_path in (payload_path, config_path):
++                try:
++                    temp_path.unlink(missing_ok=True)
++                except TypeError:
++                    if temp_path.exists():
++                        temp_path.unlink()
+         try:
+             driver_path.unlink(missing_ok=True)
+         except TypeError:
+
+
+
+
+## Review Request
+
+You are the secondary reviewer in a recursive Codex improvement loop.
+Judge only the attached local changes and their likely behavior.
+
+Original user task:
+호출기의 5개 병렬 리뷰, 저장된 candidate 파일 취합, 선택된 리뷰 기반 follow-up 워크플로우를 실제 코드 기준으로 검토하고 남은 문제만 지적해.
+
+Return JSON only with this schema:
+{
+  "verdict": "pass" | "revise",
+  "summary": "string",
+  "must_fix":
+Rules:
+- Use verdict 'pass' only when there are no material bugs, regressions, or missing tests left to address.
+- Minor style nits alone should still be 'pass'.
+- Ground every claim in the attached diff/files. Do not invent missing context.
+- Keep every string concise and in Korean.
+- must_fix, risks, and tests should each contain up to 5 items.
+- follow_up_prompt should be empty when verdict is 'pass'.
+- follow_up_prompt should be a compact instruction Codex can act on immediately when verdict is 'revise'.
+- Do not wrap the JSON in markdown fences.
+
+Extra review emphasis:
+특히 fanout candidate manifest, follow-up prompt 반영, submit 안정성, stale artifact 정리, 테스트 누락을 엄격히 봐라.
+
+Extra review lens for this run:
+- 이번 답변은 핵심 버그와 동작 회귀 가능성을 가장 엄격하게 본다. ["string"],
+  "risks": ["string"],
+  "tests": ["string"],
+  "follow_up_prompt": "string"
+}
+%}B2rhbZwt
+zX-ITwCLlAA1t=Z4yqXorh6JZ(2XY|EuL(dR5;8Rj$cY?2%?0E}PLJjR@*=lS%K-8r
+
+
+
+ChatGPT의 말:
+
+메시지 스트림에 오류 발생
+
+확장된 Pro
+ChatGPT는 실수를 할 수 있습니다. 중요한 정보는 재차 확인하세요. 쿠키 기본 설정을 참고하세요.
+ChatGPT가 아직 응답을 생성 중입니다…

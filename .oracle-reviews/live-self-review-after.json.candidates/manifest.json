@@ -1,0 +1,55 @@
+{
+  "aggregate": {},
+  "candidates": [
+    {
+      "index": 1,
+      "label": "01-regression",
+      "returncode": 1,
+      "prompt_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-01-01-regression.prompt.md",
+      "review_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-01-01-regression.txt",
+      "stdout_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-01-01-regression.stdout.log",
+      "stderr_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-01-01-regression.stderr.log",
+      "metadata": {}
+    },
+    {
+      "index": 2,
+      "label": "02-edge-cases",
+      "returncode": 1,
+      "prompt_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-02-02-edge-cases.prompt.md",
+      "review_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-02-02-edge-cases.txt",
+      "stdout_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-02-02-edge-cases.stdout.log",
+      "stderr_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-02-02-edge-cases.stderr.log",
+      "metadata": {}
+    },
+    {
+      "index": 3,
+      "label": "03-tests",
+      "returncode": 1,
+      "prompt_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-03-03-tests.prompt.md",
+      "review_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-03-03-tests.txt",
+      "stdout_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-03-03-tests.stdout.log",
+      "stderr_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-03-03-tests.stderr.log",
+      "metadata": {}
+    },
+    {
+      "index": 4,
+      "label": "04-safety",
+      "returncode": 1,
+      "prompt_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-04-04-safety.prompt.md",
+      "review_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-04-04-safety.txt",
+      "stdout_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-04-04-safety.stdout.log",
+      "stderr_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-04-04-safety.stderr.log",
+      "metadata": {}
+    },
+    {
+      "index": 5,
+      "label": "05-skeptic",
+      "returncode": 1,
+      "prompt_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-05-05-skeptic.prompt.md",
+      "review_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-05-05-skeptic.txt",
+      "stdout_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-05-05-skeptic.stdout.log",
+      "stderr_path": "/home/mrcorp/Coding/Tools/호출기/.oracle-reviews/live-self-review-after.json.candidates/candidate-05-05-skeptic.stderr.log",
+      "metadata": {}
+    }
+  ]
+}

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 def load_review_module():
@@ -159,6 +162,258 @@ class ReviewArtifactResetTests(unittest.TestCase):
             self.assertFalse(write_output.exists())
             self.assertFalse(prompt_artifact.exists())
             self.assertFalse(candidate_dir.exists())
+
+
+class CleanupHelperTests(unittest.TestCase):
+    def test_safe_unlink_ignores_locked_files(self):
+        class LockedPath:
+            def __init__(self):
+                self.calls: list[tuple[str, object]] = []
+
+            def unlink(self, missing_ok: bool = False):
+                self.calls.append(("unlink", missing_ok))
+                raise PermissionError("locked")
+
+        locked = LockedPath()
+
+        review.safe_unlink(locked)  # type: ignore[arg-type]
+
+        self.assertEqual(locked.calls, [("unlink", True)])
+
+    def test_terminate_process_waits_after_kill(self):
+        class FakeProcess:
+            def __init__(self):
+                self.wait_calls = 0
+                self.calls: list[str] = []
+
+            def poll(self):
+                self.calls.append("poll")
+                return None
+
+            def terminate(self):
+                self.calls.append("terminate")
+
+            def wait(self, timeout: float):
+                self.wait_calls += 1
+                self.calls.append(f"wait:{timeout}")
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+                return 0
+
+            def kill(self):
+                self.calls.append("kill")
+
+        process = FakeProcess()
+
+        review.terminate_process(process)  # type: ignore[arg-type]
+
+        self.assertEqual(process.calls, ["poll", "terminate", "wait:5", "kill", "wait:5"])
+
+
+class CDPReviewRunnerTests(unittest.TestCase):
+    def test_run_windows_cdp_chatgpt_cleans_driver_and_config_files(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+            payload_path = base / "payload.txt"
+            payload_path.write_text("prompt", encoding="utf-8")
+            output_path = base / "output.md"
+            created_paths: list[Path] = []
+
+            def fake_write_windows_temp_file(name: str, content: str) -> Path:
+                path = base / name
+                path.write_text(content, encoding="utf-8")
+                created_paths.append(path)
+                return path
+
+            def fake_run(args, check, capture_output):
+                config_path = Path(args[2])
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual(config["debugUrl"], "http://127.0.0.1:9870")
+                self.assertEqual(config["payloadPath"], str(payload_path))
+                self.assertEqual(config["outputPath"], str(output_path))
+                return SimpleNamespace(returncode=0, stdout=b'{"ok":true}', stderr=b"")
+
+            with patch.object(review, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
+                review, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
+            ), patch.object(review, "to_windows_path", side_effect=lambda path: str(path)), patch.object(
+                review.subprocess, "run", side_effect=fake_run
+            ):
+                completed = review.run_windows_cdp_chatgpt(
+                    payload_path=payload_path,
+                    output_path=output_path,
+                    project_url="https://chatgpt.com/g/project",
+                    model_label="ChatGPT 5.4 Pro",
+                    model_strategy="select",
+                    timeout_ms=123456,
+                    begin_marker="BEGIN",
+                    end_marker="END",
+                    debug_url=None,
+                    marker_suffix="unit",
+                )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertTrue(payload_path.exists())
+            self.assertFalse((base / "chatgpt-cdp-driver-unit.js").exists())
+            self.assertFalse((base / "codex-chatgpt-cdp-unit.json").exists())
+            self.assertEqual(len(created_paths), 2)
+
+    def test_run_windows_cdp_chatgpt_fanout_preserves_partial_results_and_cleans_temp_files(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+            created_temp_paths: list[Path] = []
+            created_output_paths: list[Path] = []
+
+            def fake_write_windows_temp_file(name: str, content: str) -> Path:
+                path = base / name
+                path.write_text(content, encoding="utf-8")
+                created_temp_paths.append(path)
+                return path
+
+            def fake_windows_temp_path(name: str) -> Path:
+                path = base / name
+                created_output_paths.append(path)
+                return path
+
+            class FakeProcess:
+                def __init__(self, config_path: Path):
+                    self.config_path = config_path
+                    self.calls: list[str] = []
+                    config = json.loads(config_path.read_text(encoding="utf-8"))
+                    output_path = Path(config["outputPath"])
+                    if output_path.name.endswith("01.md"):
+                        output_path.write_text(
+                            json.dumps(
+                                {
+                                    "verdict": "pass",
+                                    "summary": "ok",
+                                    "must_fix": [],
+                                    "risks": [],
+                                    "tests": [],
+                                    "follow_up_prompt": "",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+                        self.returncode = 0
+                    else:
+                        self.returncode = 1
+
+                def communicate(self):
+                    self.calls.append("communicate")
+                    return (b"", b"")
+
+                def poll(self):
+                    self.calls.append("poll")
+                    return self.returncode
+
+                def terminate(self):
+                    self.calls.append("terminate")
+
+                def wait(self, timeout: float):
+                    self.calls.append(f"wait:{timeout}")
+                    return self.returncode
+
+                def kill(self):
+                    self.calls.append("kill")
+
+            processes: list[FakeProcess] = []
+
+            def fake_popen(args, stdout, stderr):
+                process = FakeProcess(Path(args[2]))
+                processes.append(process)
+                return process
+
+            with patch.object(review, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
+                review, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
+            ), patch.object(review, "windows_temp_path", side_effect=fake_windows_temp_path), patch.object(
+                review, "to_windows_path", side_effect=lambda path: str(path)
+            ), patch.object(review.subprocess, "Popen", side_effect=fake_popen):
+                candidates = review.run_windows_cdp_chatgpt_fanout(
+                    review_jobs=[
+                        (1, "01-regression", "prompt-1"),
+                        (2, "02-tests", "prompt-2"),
+                    ],
+                    project_url="https://chatgpt.com/g/project",
+                    model_label="ChatGPT 5.4 Pro",
+                    model_strategy="ignore",
+                    timeout_ms=123456,
+                    debug_url=None,
+                    marker_suffix="fanout",
+                )
+
+            self.assertEqual([candidate.returncode for candidate in candidates], [0, 1])
+            self.assertIn('"verdict": "pass"', candidates[0].review_text)
+            self.assertEqual(candidates[1].review_text, "")
+            self.assertTrue(all(not path.exists() for path in created_temp_paths))
+            self.assertTrue(all(not path.exists() for path in created_output_paths))
+            self.assertFalse((base / "chatgpt-cdp-driver-fanout.js").exists())
+            self.assertEqual([process.calls for process in processes], [["communicate", "poll"], ["communicate", "poll"]])
+
+    def test_run_windows_cdp_chatgpt_fanout_preserves_original_error_when_cleanup_runs(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+
+            def fake_write_windows_temp_file(name: str, content: str) -> Path:
+                path = base / name
+                path.write_text(content, encoding="utf-8")
+                return path
+
+            def fake_windows_temp_path(name: str) -> Path:
+                return base / name
+
+            class HangingProcess:
+                def __init__(self, _config_path: Path):
+                    self.calls: list[str] = []
+                    self.wait_calls = 0
+
+                def communicate(self):
+                    self.calls.append("communicate")
+                    raise RuntimeError("boom")
+
+                def poll(self):
+                    self.calls.append("poll")
+                    return None
+
+                def terminate(self):
+                    self.calls.append("terminate")
+
+                def wait(self, timeout: float):
+                    self.wait_calls += 1
+                    self.calls.append(f"wait:{timeout}")
+                    if self.wait_calls == 1:
+                        raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+                    return 0
+
+                def kill(self):
+                    self.calls.append("kill")
+
+            process = HangingProcess(base / "unused.json")
+
+            def fake_popen(args, stdout, stderr):
+                _ = stdout, stderr
+                return process
+
+            with patch.object(review, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
+                review, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
+            ), patch.object(review, "windows_temp_path", side_effect=fake_windows_temp_path), patch.object(
+                review, "to_windows_path", side_effect=lambda path: str(path)
+            ), patch.object(review.subprocess, "Popen", side_effect=fake_popen):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    review.run_windows_cdp_chatgpt_fanout(
+                        review_jobs=[(1, "01-regression", "prompt-1")],
+                        project_url="https://chatgpt.com/g/project",
+                        model_label="ChatGPT 5.4 Pro",
+                        model_strategy="ignore",
+                        timeout_ms=123456,
+                        debug_url=None,
+                        marker_suffix="fanout-exc",
+                    )
+
+            self.assertEqual(
+                process.calls,
+                ["communicate", "poll", "terminate", "wait:5", "kill", "wait:5"],
+            )
 
 
 if __name__ == "__main__":

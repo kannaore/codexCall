@@ -435,6 +435,49 @@ def windows_temp_path(name: str) -> Path:
     return WINDOWS_TEMP_DIR / name
 
 
+def safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+        return
+    except FileNotFoundError:
+        return
+    except TypeError:
+        pass
+    except OSError:
+        return
+
+    try:
+        if path.exists():
+            path.unlink()
+    except (FileNotFoundError, OSError):
+        return
+
+
+def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 5) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        return
+
+    try:
+        process.kill()
+    except OSError:
+        return
+    try:
+        process.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return
+
+
 def to_windows_path(path: Path) -> str:
     if os.environ.get("WSL_DISTRO_NAME"):
         return run_command(["wslpath", "-m", str(path)], Path.cwd())
@@ -614,29 +657,8 @@ def run_windows_cdp_chatgpt(
             capture_output=True,
         )
     finally:
-        for _candidate, process, payload_path, config_path in running:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            for temp_path in (payload_path, config_path):
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except TypeError:
-                    if temp_path.exists():
-                        temp_path.unlink()
-        try:
-            driver_path.unlink(missing_ok=True)
-        except TypeError:
-            if driver_path.exists():
-                driver_path.unlink()
-        try:
-            config_path.unlink(missing_ok=True)
-        except TypeError:
-            if config_path.exists():
-                config_path.unlink()
+        safe_unlink(driver_path)
+        safe_unlink(config_path)
 
 
 def prepare_windows_cdp_chatgpt(
@@ -777,23 +799,17 @@ def run_windows_cdp_chatgpt_fanout(
                     metadata=metadata,
                 )
             )
-            try:
-                payload_path.unlink(missing_ok=True)
-            except TypeError:
-                if payload_path.exists():
-                    payload_path.unlink()
-            try:
-                config_path.unlink(missing_ok=True)
-            except TypeError:
-                if config_path.exists():
-                    config_path.unlink()
+            safe_unlink(payload_path)
+            safe_unlink(config_path)
         return completed_candidates
     finally:
-        try:
-            driver_path.unlink(missing_ok=True)
-        except TypeError:
-            if driver_path.exists():
-                driver_path.unlink()
+        for _candidate, process, payload_path, config_path in running:
+            terminate_process(process)
+            for temp_path in (payload_path, config_path):
+                safe_unlink(temp_path)
+        for candidate, _process, _payload_path, _config_path in running:
+            safe_unlink(candidate.output_path)
+        safe_unlink(driver_path)
 
 
 def copy_to_windows_clipboard(text: str) -> None:
@@ -833,11 +849,7 @@ def candidate_output_dir(write_output: Path) -> Path:
 
 def reset_review_artifacts(write_output: Path, prompt_artifact: Path, candidate_dir: Path) -> None:
     for path in (write_output, prompt_artifact):
-        try:
-            path.unlink(missing_ok=True)
-        except TypeError:
-            if path.exists():
-                path.unlink()
+        safe_unlink(path)
     shutil.rmtree(candidate_dir, ignore_errors=True)
 
 
@@ -1154,16 +1166,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 ]
             finally:
-                try:
-                    payload_path.unlink(missing_ok=True)
-                except TypeError:
-                    if payload_path.exists():
-                        payload_path.unlink()
-                try:
-                    windows_output_path.unlink(missing_ok=True)
-                except TypeError:
-                    if windows_output_path.exists():
-                        windows_output_path.unlink()
+                safe_unlink(payload_path)
+                safe_unlink(windows_output_path)
 
         successful_candidates = [candidate for candidate in candidate_results if candidate.returncode == 0 and candidate.review_text.strip()]
         if not successful_candidates:
@@ -1186,10 +1190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     finally:
         for temp_path in temp_paths:
-            try:
-                os.unlink(temp_path)
-            except FileNotFoundError:
-                pass
+            safe_unlink(Path(temp_path))
 
     if completed_code != 0 and os.environ.get("WSL_DISTRO_NAME"):
         print_wsl_help()

@@ -22,7 +22,19 @@ def load_loop_module():
     return module
 
 
+def load_review_module():
+    script_path = Path(__file__).resolve().parents[1] / "codex-gpt54-review"
+    loader = SourceFileLoader("codex_gpt54_review_for_loop_tests", str(script_path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 loop = load_loop_module()
+review_runner = load_review_module()
 
 
 class ParseReviewDecisionTests(unittest.TestCase):
@@ -101,6 +113,61 @@ class PromptFormattingTests(unittest.TestCase):
         self.assertIn("선택 후보 02 [02-edge-cases]", prompt)
         self.assertIn("선택된 저장 리뷰: /tmp/review-02.txt", prompt)
         self.assertIn("선택 후보 프롬프트: /tmp/review-02.prompt.md", prompt)
+
+    def test_follow_up_prompt_reads_selected_paths_from_review_artifact_manifest(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+            review_path = base / "round-01.review.json"
+            candidate_dir = base / "round-01.review.json.candidates"
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            selected_prompt = candidate_dir / "candidate-02-02-edge-cases.prompt.md"
+            selected_prompt.write_text("prompt-2", encoding="utf-8")
+
+            review_payload = {
+                "verdict": "revise",
+                "summary": "정리 경로 점검 필요",
+                "must_fix": ["cleanup 회귀 테스트 추가"],
+                "risks": [],
+                "tests": ["manifest 기반 follow-up 테스트"],
+                "follow_up_prompt": "manifest 경로를 따라 후속 프롬프트를 구성해라",
+            }
+            review_text = json.dumps(review_payload, ensure_ascii=False)
+            review_path.write_text(review_text, encoding="utf-8")
+
+            candidate = review_runner.ReviewCandidate(
+                index=2,
+                label="02-edge-cases",
+                prompt_text="prompt-2",
+                review_text=review_text,
+                output_path=Path("/tmp/windows-output-02.md"),
+                returncode=0,
+                stdout_text="",
+                stderr_text="",
+                metadata={},
+            )
+            review_runner.write_candidate_artifacts(
+                candidate_dir,
+                [candidate],
+                {
+                    "mode": "structured-consensus",
+                    "selected_candidate": 2,
+                    "selected_label": "02-edge-cases",
+                    "valid_candidate_count": 5,
+                    "revise_count": 4,
+                },
+            )
+
+            candidate_manifest = loop.load_review_candidate_manifest(review_path)
+            prompt = loop.build_follow_up_prompt(loop.parse_review_decision(review_text), candidate_manifest)
+
+            self.assertIsNotNone(candidate_manifest)
+            assert candidate_manifest is not None
+            self.assertEqual(candidate_manifest["aggregate"]["selected_candidate"], 2)
+            self.assertTrue(candidate_manifest["aggregate"]["selected_review_path"].endswith("candidate-02-02-edge-cases.txt"))
+            self.assertTrue(candidate_manifest["aggregate"]["selected_prompt_path"].endswith("candidate-02-02-edge-cases.prompt.md"))
+            self.assertIn("선택 후보 02 [02-edge-cases]", prompt)
+            self.assertIn("선택된 저장 리뷰:", prompt)
+            self.assertIn("선택 후보 프롬프트:", prompt)
 
     def test_build_review_prompt_embeds_task_and_note(self):
         prompt = loop.build_review_prompt("로그인 버그 수정", "세션 만료 케이스를 특히 봐라")
