@@ -31,18 +31,24 @@ async function main() {
     beginMarker,
     endMarker,
     timeoutMs = 120000,
+    connectTimeoutMs = 120000,
     projectUrl = "",
     modelLabel = "",
     modelStrategy = "ignore",
+    preferNewPage = false,
+    prepareOnly = false,
   } = config;
 
-  if (!debugUrl || !payloadPath || !outputPath || !beginMarker || !endMarker) {
+  if (!debugUrl) {
+    throw new Error("Missing required config fields.");
+  }
+  if (!prepareOnly && (!payloadPath || !outputPath || !beginMarker || !endMarker)) {
     throw new Error("Missing required config fields.");
   }
 
-  const payload = fs.readFileSync(payloadPath, "utf8");
+  const payload = prepareOnly ? "" : fs.readFileSync(payloadPath, "utf8");
   const playwright = loadPlaywright();
-  const browser = await playwright.chromium.connectOverCDP(debugUrl);
+  const browser = await playwright.chromium.connectOverCDP(debugUrl, { timeout: connectTimeoutMs });
 
   function normalizeModelLabel(value) {
     return String(value || "")
@@ -121,6 +127,116 @@ async function main() {
     throw new Error(`Failed to switch ChatGPT model to "${desiredLabel}". Current button text: "${afterText}".`);
   }
 
+  async function clearEditor(page, editor) {
+    await editor.click();
+    await page.keyboard.press("Control+A").catch(() => {});
+    await page.keyboard.press("Backspace").catch(() => {});
+    await editor.evaluate((node) => {
+      node.textContent = "";
+      node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward", data: null }));
+    }).catch(() => {});
+  }
+
+  async function injectPrompt(page, editor, payloadText) {
+    await clearEditor(page, editor);
+    const chunks = [];
+    const chunkSize = 4000;
+    for (let index = 0; index < payloadText.length; index += chunkSize) {
+      chunks.push(payloadText.slice(index, index + chunkSize));
+    }
+    for (const chunk of chunks) {
+      await page.keyboard.insertText(chunk);
+      await page.waitForTimeout(20);
+    }
+    const editorText = await editor.innerText().catch(() => "");
+    if (!editorText || editorText.length < Math.min(payloadText.length, 200)) {
+      throw new Error(`Prompt injection appears incomplete. Expected ${payloadText.length} chars, saw ${editorText.length}.`);
+    }
+  }
+
+  async function submitPrompt(page, editor) {
+    await page.keyboard.press("Enter").catch(() => {});
+    await page.waitForTimeout(1200);
+
+    const residualText = await editor.innerText().catch(() => "");
+    if (!residualText.trim()) {
+      return;
+    }
+
+    const candidates = [
+      page.getByTestId("send-button").first(),
+      page.locator('button[aria-label*="Send"]').first(),
+      page.locator('button[aria-label*="전송"]').first(),
+      page.locator('button[aria-label*="Submit"]').first(),
+      page.locator('button svg').locator("..").first(),
+    ];
+
+    for (const candidate of candidates) {
+      try {
+        await candidate.waitFor({ timeout: 1500 });
+        await candidate.click();
+        await page.waitForTimeout(1200);
+        const afterText = await editor.innerText().catch(() => "");
+        if (!afterText.trim()) {
+          return;
+        }
+      } catch (_error) {
+        continue;
+      }
+    }
+
+    const nearestButton = await page.evaluate(() => {
+      const editorNode = document.querySelector("#prompt-textarea");
+      if (!(editorNode instanceof HTMLElement)) {
+        return null;
+      }
+      const editorRect = editorNode.getBoundingClientRect();
+      const buttons = Array.from(document.querySelectorAll("button")).filter((button) => {
+        if (!(button instanceof HTMLButtonElement) || button.disabled) {
+          return false;
+        }
+        const style = window.getComputedStyle(button);
+        if (style.visibility === "hidden" || style.display === "none") {
+          return false;
+        }
+        const rect = button.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      });
+      let bestButton = null;
+      let bestScore = Number.POSITIVE_INFINITY;
+      for (const button of buttons) {
+        const rect = button.getBoundingClientRect();
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        const targetX = editorRect.right;
+        const targetY = editorRect.bottom;
+        const distance = (centerX - targetX) ** 2 + (centerY - targetY) ** 2;
+        if (distance < bestScore) {
+          bestScore = distance;
+          bestButton = button;
+        }
+      }
+      if (!bestButton) {
+        return null;
+      }
+      bestButton.click();
+      return {
+        aria: bestButton.getAttribute("aria-label") || "",
+        text: (bestButton.innerText || "").trim(),
+        testid: bestButton.getAttribute("data-testid") || "",
+      };
+    }).catch(() => null);
+    if (nearestButton) {
+      await page.waitForTimeout(1200);
+      const afterNearestClickText = await editor.innerText().catch(() => "");
+      if (!afterNearestClickText.trim()) {
+        return;
+      }
+    }
+
+    throw new Error("Prompt submit did not clear the editor after Enter and send-button fallbacks.");
+  }
+
   try {
     const context = browser.contexts()[0];
     if (!context) {
@@ -135,22 +251,30 @@ async function main() {
     }));
 
     let page = null;
+    let sourcePage = null;
     if (projectUrl) {
-      page = pages.find((candidate) => (candidate.url() || "").startsWith(projectUrl));
+      sourcePage = pages.find((candidate) => (candidate.url() || "").startsWith(projectUrl));
     }
-    if (!page) {
-      page = pages.find((candidate) => {
+    if (!sourcePage) {
+      sourcePage = pages.find((candidate) => {
         const url = candidate.url() || "";
         return url.startsWith("https://chatgpt.com/") && !url.includes("auth/login");
       });
     }
-    if (!page) {
-      page = pages[0] || (await context.newPage());
+    if (!sourcePage) {
+      sourcePage = pages[0] || null;
+    }
+
+    if (preferNewPage) {
+      page = await context.newPage();
+    } else {
+      page = sourcePage || (await context.newPage());
     }
 
     await page.bringToFront();
-    if (projectUrl && !(page.url() || "").startsWith(projectUrl)) {
-      await page.goto(projectUrl, { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
+    const targetUrl = projectUrl || (preferNewPage && sourcePage ? sourcePage.url() : "");
+    if (targetUrl && ((preferNewPage && (page.url() || "") !== targetUrl) || (projectUrl && !(page.url() || "").startsWith(projectUrl)))) {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
     }
 
     await page.waitForTimeout(1000);
@@ -167,11 +291,24 @@ async function main() {
       throw new Error(`Login is required for the current page: ${url}`);
     }
 
+    if (prepareOnly) {
+      console.log(
+        JSON.stringify({
+          ok: true,
+          prepared: true,
+          url: page.url(),
+          pages: pageSummaries,
+          modelLabel,
+          modelStrategy,
+        }),
+      );
+      return;
+    }
+
     const editor = page.locator("#prompt-textarea").first();
     await editor.waitFor({ timeout: 20000 });
-    await editor.click();
-    await editor.fill(payload);
-    await page.keyboard.press("Enter");
+    await injectPrompt(page, editor, payload);
+    await submitPrompt(page, editor);
 
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {

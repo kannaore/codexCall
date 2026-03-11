@@ -33,6 +33,7 @@ codex-gpt54-review
 codex-gpt54-review --dry-run
 codex-gpt54-review --mode hybrid --file docs/spec.md
 codex-gpt54-review --prompt "이번 변경에서 버그, 회귀, 빠진 테스트만 짚어줘."
+codex-gpt54-review --fanout-count 5 --fanout-strategy angled
 codex-gpt54-review --write-output /tmp/review.md
 codex-gpt54-review --delivery manual
 codex-gpt54-review --delivery pinchtab
@@ -40,6 +41,7 @@ codex-gpt54-review --model "ChatGPT 5.3 Instant" --model-strategy select
 codex-gpt54-loop "결제 실패 재시도 로직을 안정화해줘."
 codex-gpt54-loop --feedback-mode manual --max-rounds 4 "파일 업로드 race condition을 잡아줘."
 codex-gpt54-loop --codex-full-auto --review-mode hybrid --review-file docs/spec.md "대시보드 필터 버그를 수정해줘."
+codex-gpt54-loop --review-fanout-count 5 --review-fanout-strategy angled --review-model "ChatGPT 5.4 Pro" "5개 병렬 리뷰를 거쳐 수정해."
 codex-gpt54-loop --codex-resume-last --review-model "ChatGPT 5.4 Pro" --review-model-strategy select "방금 받은 리뷰 지적을 반영해."
 codex-gpt54-loop --codex-session-id 019cda71-cbe0-7533-8e25-2ced2d2ae992 --review-model "ChatGPT 5.4 Pro" "현재 Codex 세션에 후속 작업을 주입해."
 ```
@@ -52,6 +54,8 @@ codex-gpt54-loop --codex-session-id 019cda71-cbe0-7533-8e25-2ced2d2ae992 --revie
 - browser for manual fallback: your normal Windows browser
 - model: `ChatGPT 5.4 Pro`
 - model strategy: `select`
+- parallel review tabs: `5`
+- fanout strategy: `angled`
 - project URL: `Codex전용`
 - attachment mode: `diff`
 - output file: `./.oracle-reviews/review-YYYYmmdd-HHMMSS.md`
@@ -66,8 +70,10 @@ Recursive loop defaults:
 - review format: strict JSON verdict (`pass` or `revise`)
 - review delivery: `cdp`
 - review model strategy: `select`
+- review fanout: `5` parallel tabs with consensus aggregation
 - session artifacts: `./.oracle-reviews/loop-YYYYmmdd-HHMMSS/`
-- saved artifacts per round: Codex JSONL, Codex last message, review JSON, stdout/stderr logs, manifest
+- saved artifacts per round: Codex JSONL, Codex last message, aggregated review JSON, per-candidate review/stdout/stderr logs, manifest
+- fanout model handling: CDP preselects the requested model once on the `Codex전용` project tab, then opens fresh review tabs
 
 ## WSL note
 
@@ -78,9 +84,10 @@ Manual mode exists only as a fallback.
 `codex-gpt54-loop` builds on top of that review runner. Each round does:
 
 1. `codex exec` for the requested task
-2. `codex-gpt54-review` with a structured JSON review prompt
-3. verdict check
-4. automatic or manual feedback injection back into the same Codex session
+2. `codex-gpt54-review` with 5 parallel ChatGPT tabs by default
+3. consensus aggregation across the candidate reviews
+4. verdict check
+5. automatic or manual feedback injection back into the same Codex session
 
 If you already have a live Codex session, add `--codex-session-id <uuid>` or `--codex-resume-last` so the loop injects prompts into that existing session instead of starting a fresh one. For code changes, that existing session should already be opened in the target repository.
 
@@ -107,6 +114,7 @@ Current limitations:
 - Pinchtab mode cannot switch ChatGPT models automatically; use `--delivery cdp` for enforced model selection.
 - Manual mode copies the prompt and opens the project URL, but you still paste/send in ChatGPT yourself.
 - CDP mode now selects or verifies the project-page model picker on `Codex전용`.
+- Multi-review fanout is available only in `--delivery cdp`.
 - Keep Python Playwright/browser dependencies installed if you want Scrapling dynamic fetchers.
 
 If you later add an API key, you can still switch to:

@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,11 +35,34 @@ DEFAULT_OUTPUT_DIR = ".oracle-reviews"
 DEFAULT_DELIVERY = "cdp"
 DEFAULT_MODEL = "ChatGPT 5.4 Pro"
 DEFAULT_MODEL_STRATEGY = "select"
+DEFAULT_FANOUT_COUNT = 5
+DEFAULT_FANOUT_STRATEGY = "angled"
 WINDOWS_TEMP_DIR = Path("/mnt/c/Users/Administrator/AppData/Local/Temp")
 WINDOWS_RUNNER_DIR = Path("/mnt/c/Users/Administrator/AppData/Local/CodexChatGPTRunner")
 WINDOWS_NODE = "/mnt/c/Program Files/nodejs/node.exe"
 MAX_FILE_CHARS = 12000
 MAX_BUNDLE_CHARS = 100000
+
+REVIEW_ANGLE_PRESETS: list[tuple[str, str]] = [
+    ("regression", "이번 답변은 핵심 버그와 동작 회귀 가능성을 가장 엄격하게 본다."),
+    ("edge-cases", "이번 답변은 경계값, 예외 경로, 실패 모드를 우선 검토한다."),
+    ("tests", "이번 답변은 빠진 테스트, 재현성, 회귀 방지 측면을 우선 검토한다."),
+    ("safety", "이번 답변은 더 단순하고 안전한 구현, 불필요한 복잡도, 유지보수 리스크를 우선 검토한다."),
+    ("skeptic", "이번 답변은 과도한 지적을 줄이고 실제 근거가 충분한 문제만 남기도록 검토한다."),
+]
+
+
+@dataclass
+class ReviewCandidate:
+    index: int
+    label: str
+    prompt_text: str
+    review_text: str
+    output_path: Path
+    returncode: int
+    stdout_text: str
+    stderr_text: str
+    metadata: dict[str, object]
 
 
 def run_command(args: Sequence[str], cwd: Path) -> str:
@@ -52,6 +78,195 @@ def run_command(args: Sequence[str], cwd: Path) -> str:
 
 def split_non_empty(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def ensure_text_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value is None:
+        return []
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def extract_json_object(text: str) -> dict[str, object]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+
+    candidates = [stripped]
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(stripped[start : end + 1])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            loaded = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(loaded, dict):
+            return loaded
+
+    raise ValueError("Review output was not valid JSON.")
+
+
+def build_review_variants(base_prompt: str, count: int, strategy: str) -> list[tuple[str, str]]:
+    prompt_text = base_prompt.strip()
+    if count < 1:
+        raise ValueError("fanout count must be at least 1")
+
+    variants: list[tuple[str, str]] = []
+    if strategy == "identical":
+        for index in range(count):
+            variants.append((f"candidate-{index + 1:02d}", prompt_text))
+        return variants
+
+    if strategy != "angled":
+        raise ValueError(f"Unsupported fanout strategy: {strategy}")
+
+    for index in range(count):
+        label, lens = REVIEW_ANGLE_PRESETS[index % len(REVIEW_ANGLE_PRESETS)]
+        prompt = (
+            f"{prompt_text}\n\n"
+            "Extra review lens for this run:\n"
+            f"- {lens}"
+        )
+        variants.append((f"{index + 1:02d}-{label}", prompt))
+    return variants
+
+
+def rank_text_items(values: list[list[str]], *, limit: int = 5) -> list[str]:
+    counts: Counter[str] = Counter()
+    first_seen: dict[str, tuple[int, int]] = {}
+    for candidate_index, items in enumerate(values):
+        for item_index, item in enumerate(items):
+            text = item.strip()
+            if not text:
+                continue
+            counts[text] += 1
+            first_seen.setdefault(text, (candidate_index, item_index))
+    ranked = sorted(counts, key=lambda text: (-counts[text], first_seen[text][0], first_seen[text][1], text))
+    return ranked[:limit]
+
+
+def score_structured_payload(payload: dict[str, object]) -> tuple[int, int]:
+    verdict = str(payload.get("verdict", "")).strip().lower()
+    must_fix = ensure_text_list(payload.get("must_fix"))
+    risks = ensure_text_list(payload.get("risks"))
+    tests = ensure_text_list(payload.get("tests"))
+    follow_up = str(payload.get("follow_up_prompt", "")).strip()
+    summary = str(payload.get("summary", "")).strip()
+    primary = 0
+    if verdict == "revise":
+        primary += 100
+    primary += len(must_fix) * 20
+    primary += len(tests) * 12
+    primary += len(risks) * 8
+    if follow_up:
+        primary += 10
+    return primary, len(summary)
+
+
+def build_consensus_follow_up(must_fix: list[str], tests: list[str], anchor_prompt: str) -> str:
+    if anchor_prompt.strip():
+        return anchor_prompt.strip()
+    parts: list[str] = []
+    if must_fix:
+        parts.append("다음 문제를 먼저 수정해라: " + "; ".join(must_fix[:3]))
+    if tests:
+        parts.append("그리고 테스트를 보강해라: " + "; ".join(tests[:2]))
+    return " ".join(parts).strip()
+
+
+def aggregate_structured_candidates(candidates: Sequence[ReviewCandidate]) -> tuple[str, dict[str, object]]:
+    parsed: list[tuple[ReviewCandidate, dict[str, object]]] = []
+    for candidate in candidates:
+        try:
+            payload = extract_json_object(candidate.review_text)
+        except ValueError:
+            continue
+        verdict = str(payload.get("verdict", "")).strip().lower()
+        if verdict not in {"pass", "revise"}:
+            continue
+        parsed.append((candidate, payload))
+
+    if not parsed:
+        raise ValueError("No valid structured review response was found.")
+
+    revise = [(candidate, payload) for candidate, payload in parsed if str(payload.get("verdict", "")).strip().lower() == "revise"]
+    anchor_source = revise if revise else parsed
+    anchor_candidate, anchor_payload = max(anchor_source, key=lambda item: score_structured_payload(item[1]))
+
+    must_fix = rank_text_items([ensure_text_list(payload.get("must_fix")) for _candidate, payload in parsed])
+    risks = rank_text_items([ensure_text_list(payload.get("risks")) for _candidate, payload in parsed])
+    tests = rank_text_items([ensure_text_list(payload.get("tests")) for _candidate, payload in parsed])
+    follow_up_prompt = ""
+    verdict = "pass" if not revise else "revise"
+    if verdict == "revise":
+        follow_up_prompt = build_consensus_follow_up(
+            must_fix,
+            tests,
+            str(anchor_payload.get("follow_up_prompt", "")).strip(),
+        )
+
+    summary = str(anchor_payload.get("summary", "")).strip()
+    if verdict == "revise" and not summary:
+        summary = "여러 리뷰에서 수정 필요 항목이 확인되었다."
+    if verdict == "pass" and not summary:
+        summary = "여러 리뷰에서 치명적 문제는 발견되지 않았다."
+
+    aggregated = {
+        "verdict": verdict,
+        "summary": summary,
+        "must_fix": must_fix,
+        "risks": risks,
+        "tests": tests,
+        "follow_up_prompt": follow_up_prompt,
+    }
+    metadata = {
+        "mode": "structured-consensus",
+        "selected_candidate": anchor_candidate.index,
+        "selected_label": anchor_candidate.label,
+        "valid_candidate_count": len(parsed),
+        "revise_count": len(revise),
+    }
+    return json.dumps(aggregated, ensure_ascii=False, indent=2) + "\n", metadata
+
+
+def score_plaintext_review(text: str) -> tuple[int, int]:
+    body = text.strip()
+    score = len(body)
+    for keyword in ("핵심", "리스크", "테스트", "바로 고칠 것", "must_fix", "follow_up_prompt"):
+        if keyword in body:
+            score += 120
+    score += min(len(split_non_empty(body)), 12) * 25
+    return score, len(body)
+
+
+def aggregate_plaintext_candidates(candidates: Sequence[ReviewCandidate]) -> tuple[str, dict[str, object]]:
+    selected = max(candidates, key=lambda candidate: score_plaintext_review(candidate.review_text))
+    metadata = {
+        "mode": "best-text",
+        "selected_candidate": selected.index,
+        "selected_label": selected.label,
+        "valid_candidate_count": len(candidates),
+    }
+    return selected.review_text, metadata
+
+
+def aggregate_review_candidates(candidates: Sequence[ReviewCandidate]) -> tuple[str, dict[str, object]]:
+    try:
+        return aggregate_structured_candidates(candidates)
+    except ValueError:
+        return aggregate_plaintext_candidates(candidates)
 
 
 def is_reviewable_path(path: Path) -> bool:
@@ -352,34 +567,41 @@ exit 1
 
 def run_windows_cdp_chatgpt(
     *,
-    payload_path: Path,
-    output_path: Path,
+    payload_path: Path | None,
+    output_path: Path | None,
     project_url: str,
     model_label: str,
     model_strategy: str,
     timeout_ms: int,
-    begin_marker: str,
-    end_marker: str,
+    begin_marker: str | None,
+    end_marker: str | None,
     debug_url: str | None,
     marker_suffix: str,
+    prefer_new_page: bool = False,
+    prepare_only: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     resolved_debug_url = debug_url or detect_windows_cdp_debug_url()
     driver_source = Path("/home/mrcorp/Coding/Tools/호출기/chatgpt-cdp-smoke.js").read_text(encoding="utf-8")
-    driver_path = write_windows_temp_file("chatgpt-cdp-driver.js", driver_source)
-    config_payload = json.dumps(
-        {
-            "debugUrl": resolved_debug_url,
-            "payloadPath": to_windows_path(payload_path),
-            "outputPath": to_windows_path(output_path),
-            "beginMarker": begin_marker,
-            "endMarker": end_marker,
-            "timeoutMs": timeout_ms,
-            "projectUrl": project_url,
-            "modelLabel": model_label,
-            "modelStrategy": model_strategy,
-        },
-        ensure_ascii=False,
-    )
+    driver_path = write_windows_temp_file(f"chatgpt-cdp-driver-{marker_suffix}.js", driver_source)
+    payload: dict[str, object] = {
+        "debugUrl": resolved_debug_url,
+        "timeoutMs": timeout_ms,
+        "connectTimeoutMs": max(timeout_ms, 120000),
+        "projectUrl": project_url,
+        "modelLabel": model_label,
+        "modelStrategy": model_strategy,
+        "preferNewPage": prefer_new_page,
+        "prepareOnly": prepare_only,
+    }
+    if payload_path is not None:
+        payload["payloadPath"] = to_windows_path(payload_path)
+    if output_path is not None:
+        payload["outputPath"] = to_windows_path(output_path)
+    if begin_marker is not None:
+        payload["beginMarker"] = begin_marker
+    if end_marker is not None:
+        payload["endMarker"] = end_marker
+    config_payload = json.dumps(payload, ensure_ascii=False)
     config_path = write_windows_temp_file(f"codex-chatgpt-cdp-{marker_suffix}.json", config_payload)
     try:
         return subprocess.run(
@@ -392,11 +614,186 @@ def run_windows_cdp_chatgpt(
             capture_output=True,
         )
     finally:
+        for _candidate, process, payload_path, config_path in running:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            for temp_path in (payload_path, config_path):
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except TypeError:
+                    if temp_path.exists():
+                        temp_path.unlink()
+        try:
+            driver_path.unlink(missing_ok=True)
+        except TypeError:
+            if driver_path.exists():
+                driver_path.unlink()
         try:
             config_path.unlink(missing_ok=True)
         except TypeError:
             if config_path.exists():
                 config_path.unlink()
+
+
+def prepare_windows_cdp_chatgpt(
+    *,
+    project_url: str,
+    model_label: str,
+    model_strategy: str,
+    debug_url: str | None,
+    marker_suffix: str,
+) -> None:
+    last_error = ""
+    for attempt in range(1, 3):
+        completed = run_windows_cdp_chatgpt(
+            payload_path=None,
+            output_path=None,
+            project_url=project_url,
+            model_label=model_label,
+            model_strategy=model_strategy,
+            timeout_ms=180000,
+            begin_marker=None,
+            end_marker=None,
+            debug_url=debug_url,
+            marker_suffix=f"{marker_suffix}-prepare-{attempt}",
+            prefer_new_page=False,
+            prepare_only=True,
+        )
+        if completed.returncode == 0:
+            return
+        stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
+        stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
+        last_error = (stderr_text or stdout_text or "Failed to prepare ChatGPT project page.").strip()
+        if "connectOverCDP: Timeout" not in last_error or attempt == 2:
+            break
+        time.sleep(2)
+    raise RuntimeError(last_error or "Failed to prepare ChatGPT project page.")
+
+
+def run_windows_cdp_chatgpt_fanout(
+    *,
+    review_jobs: Sequence[tuple[int, str, str]],
+    project_url: str,
+    model_label: str,
+    model_strategy: str,
+    timeout_ms: int,
+    debug_url: str | None,
+    marker_suffix: str,
+) -> list[ReviewCandidate]:
+    resolved_debug_url = debug_url or detect_windows_cdp_debug_url()
+    effective_model_strategy = model_strategy
+    if model_strategy == "select":
+        prepare_windows_cdp_chatgpt(
+            project_url=project_url,
+            model_label=model_label,
+            model_strategy=model_strategy,
+            debug_url=resolved_debug_url,
+            marker_suffix=marker_suffix,
+        )
+        effective_model_strategy = "ignore"
+    driver_source = Path("/home/mrcorp/Coding/Tools/호출기/chatgpt-cdp-smoke.js").read_text(encoding="utf-8")
+    driver_path = write_windows_temp_file(f"chatgpt-cdp-driver-{marker_suffix}.js", driver_source)
+    running: list[tuple[ReviewCandidate, subprocess.Popen[bytes], Path, Path]] = []
+    try:
+        for index, label, prompt_text in review_jobs:
+            begin_marker = f"BEGIN_CDX_REVIEW_{marker_suffix}_{index:02d}"
+            end_marker = f"END_CDX_REVIEW_{marker_suffix}_{index:02d}"
+            payload_path = write_windows_temp_file(
+                f"codex-chatgpt-payload-{marker_suffix}-{index:02d}.txt",
+                prompt_text,
+            )
+            output_path = windows_temp_path(f"codex-chatgpt-output-{marker_suffix}-{index:02d}.md")
+            config_payload = json.dumps(
+                {
+                    "debugUrl": resolved_debug_url,
+                    "payloadPath": to_windows_path(payload_path),
+                    "outputPath": to_windows_path(output_path),
+                    "beginMarker": begin_marker,
+                    "endMarker": end_marker,
+                    "timeoutMs": timeout_ms,
+                    "projectUrl": project_url,
+                    "modelLabel": model_label,
+                    "modelStrategy": effective_model_strategy,
+                    "preferNewPage": True,
+                },
+                ensure_ascii=False,
+            )
+            config_path = write_windows_temp_file(
+                f"codex-chatgpt-cdp-{marker_suffix}-{index:02d}.json",
+                config_payload,
+            )
+            process = subprocess.Popen(
+                [
+                    WINDOWS_NODE,
+                    to_windows_path(driver_path),
+                    to_windows_path(config_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            candidate = ReviewCandidate(
+                index=index,
+                label=label,
+                prompt_text=prompt_text,
+                review_text="",
+                output_path=output_path,
+                returncode=-1,
+                stdout_text="",
+                stderr_text="",
+                metadata={},
+            )
+            running.append((candidate, process, payload_path, config_path))
+
+        completed_candidates: list[ReviewCandidate] = []
+        for candidate, process, payload_path, config_path in running:
+            stdout_bytes, stderr_bytes = process.communicate()
+            stdout_text = decode_windows_bytes(stdout_bytes) if stdout_bytes else ""
+            stderr_text = decode_windows_bytes(stderr_bytes) if stderr_bytes else ""
+            review_text = ""
+            if candidate.output_path.exists() and candidate.output_path.stat().st_size > 0:
+                review_text = candidate.output_path.read_text(encoding="utf-8", errors="replace")
+            metadata: dict[str, object] = {}
+            if stdout_text.strip():
+                try:
+                    loaded = json.loads(stdout_text.strip().splitlines()[-1])
+                except json.JSONDecodeError:
+                    loaded = {}
+                if isinstance(loaded, dict):
+                    metadata = loaded
+            completed_candidates.append(
+                ReviewCandidate(
+                    index=candidate.index,
+                    label=candidate.label,
+                    prompt_text=candidate.prompt_text,
+                    review_text=review_text or stdout_text.strip(),
+                    output_path=candidate.output_path,
+                    returncode=process.returncode or 0,
+                    stdout_text=stdout_text,
+                    stderr_text=stderr_text,
+                    metadata=metadata,
+                )
+            )
+            try:
+                payload_path.unlink(missing_ok=True)
+            except TypeError:
+                if payload_path.exists():
+                    payload_path.unlink()
+            try:
+                config_path.unlink(missing_ok=True)
+            except TypeError:
+                if config_path.exists():
+                    config_path.unlink()
+        return completed_candidates
+    finally:
+        try:
+            driver_path.unlink(missing_ok=True)
+        except TypeError:
+            if driver_path.exists():
+                driver_path.unlink()
 
 
 def copy_to_windows_clipboard(text: str) -> None:
@@ -428,6 +825,62 @@ def open_windows_browser(url: str) -> None:
         check=True,
         capture_output=True,
     )
+
+
+def candidate_output_dir(write_output: Path) -> Path:
+    return write_output.parent / f"{write_output.name}.candidates"
+
+
+def reset_review_artifacts(write_output: Path, prompt_artifact: Path, candidate_dir: Path) -> None:
+    for path in (write_output, prompt_artifact):
+        try:
+            path.unlink(missing_ok=True)
+        except TypeError:
+            if path.exists():
+                path.unlink()
+    shutil.rmtree(candidate_dir, ignore_errors=True)
+
+
+def write_candidate_artifacts(candidate_dir: Path, candidates: Sequence[ReviewCandidate], aggregate_meta: dict[str, object]) -> None:
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, object] = {
+        "aggregate": aggregate_meta,
+        "candidates": [],
+    }
+    selected_entry: dict[str, object] | None = None
+    for candidate in candidates:
+        review_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.txt"
+        stdout_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.stdout.log"
+        stderr_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.stderr.log"
+        prompt_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.prompt.md"
+        review_path.write_text(candidate.review_text, encoding="utf-8")
+        stdout_path.write_text(candidate.stdout_text, encoding="utf-8")
+        stderr_path.write_text(candidate.stderr_text, encoding="utf-8")
+        entry = {
+            "index": candidate.index,
+            "label": candidate.label,
+            "returncode": candidate.returncode,
+            "prompt_path": str(prompt_path),
+            "review_path": str(review_path),
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "metadata": candidate.metadata,
+        }
+        manifest["candidates"].append(entry)
+        if (
+            int(aggregate_meta.get("selected_candidate", -1)) == candidate.index
+            and str(aggregate_meta.get("selected_label", "")) == candidate.label
+        ):
+            selected_entry = entry
+    if selected_entry is not None:
+        manifest["aggregate"] = {
+            **aggregate_meta,
+            "selected_prompt_path": selected_entry["prompt_path"],
+            "selected_review_path": selected_entry["review_path"],
+            "selected_stdout_path": selected_entry["stdout_path"],
+            "selected_stderr_path": selected_entry["stderr_path"],
+        }
+    (candidate_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -463,6 +916,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--no-project-url", action="store_true", help="Do not force a ChatGPT project URL.")
     parser.add_argument("--write-output", default=None, help="Save the final assistant message to this file.")
     parser.add_argument("--timeout-ms", type=int, default=900000, help="Wait budget for the ChatGPT answer.")
+    parser.add_argument("--fanout-count", type=int, default=DEFAULT_FANOUT_COUNT, help="How many independent ChatGPT review tabs to run.")
+    parser.add_argument(
+        "--fanout-strategy",
+        default=DEFAULT_FANOUT_STRATEGY,
+        choices=["angled", "identical"],
+        help="Whether the parallel review prompts should use different review lenses or the same prompt.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Preview without sending.")
     parser.add_argument("--render", action="store_true", help="Render the assembled prompt bundle.")
     return parser.parse_args(argv)
@@ -490,6 +950,9 @@ def print_manual_help(project_url: str, prompt_artifact: Path) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    if args.fanout_count < 1:
+        print("--fanout-count must be at least 1.", file=sys.stderr)
+        return 2
     repo_root = detect_repo_root(Path(args.repo).resolve())
     branch = detect_branch(repo_root)
 
@@ -528,22 +991,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     temp_paths.append(context_file)
 
-    marker_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
-    begin_marker = f"BEGIN_CDX_REVIEW_{marker_suffix}"
-    end_marker = f"END_CDX_REVIEW_{marker_suffix}"
-    bundle_text = build_bundle_text(
-        repo_root=repo_root,
-        prompt_text=args.prompt,
-        context_text=context_file.read_text(encoding="utf-8"),
-        attachments=attachments,
-        begin_marker=begin_marker,
-        end_marker=end_marker,
-    )
     write_output = Path(args.write_output).resolve() if args.write_output else default_output_path(repo_root)
+    candidate_dir = candidate_output_dir(write_output)
     prompt_artifact = write_output.with_suffix(".prompt.md")
+    reset_review_artifacts(write_output, prompt_artifact, candidate_dir)
+    marker_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+    review_variants = build_review_variants(args.prompt, args.fanout_count, args.fanout_strategy)
+    context_text = context_file.read_text(encoding="utf-8")
+    candidate_jobs: list[tuple[int, str, str, str]] = []
+    prompt_artifact.parent.mkdir(parents=True, exist_ok=True)
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    prompt_index_lines: list[str] = []
+    for index, (label, variant_prompt) in enumerate(review_variants, start=1):
+        begin_marker = f"BEGIN_CDX_REVIEW_{marker_suffix}_{index:02d}"
+        end_marker = f"END_CDX_REVIEW_{marker_suffix}_{index:02d}"
+        bundle_text = build_bundle_text(
+            repo_root=repo_root,
+            prompt_text=variant_prompt,
+            context_text=context_text,
+            attachments=attachments,
+            begin_marker=begin_marker,
+            end_marker=end_marker,
+        )
+        prompt_path = candidate_dir / f"candidate-{index:02d}-{label}.prompt.md"
+        prompt_path.write_text(bundle_text, encoding="utf-8")
+        prompt_index_lines.append(f"- candidate {index:02d} [{label}]: {prompt_path}")
+        candidate_jobs.append((index, label, variant_prompt, bundle_text))
+
+    prompt_artifact.write_text(
+        "Parallel review prompt set\n\n" + "\n".join(prompt_index_lines) + "\n",
+        encoding="utf-8",
+    )
+
     print(f"Output file: {write_output}")
     if args.render or args.dry_run:
-        print(bundle_text)
+        for index, label, _variant_prompt, bundle_text in candidate_jobs:
+            print(f"===== candidate {index:02d} [{label}] =====")
+            print(bundle_text)
         if args.dry_run:
             for temp_path in temp_paths:
                 try:
@@ -552,11 +1036,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     pass
             return 0
 
-    prompt_artifact.parent.mkdir(parents=True, exist_ok=True)
-    prompt_artifact.write_text(bundle_text, encoding="utf-8")
-
     if args.delivery == "manual":
-        copy_to_windows_clipboard(bundle_text)
+        if args.fanout_count > 1:
+            print("Manual delivery does not support multi-review fanout. Use `--delivery cdp`.", file=sys.stderr)
+            for temp_path in temp_paths:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+            return 2
+        copy_to_windows_clipboard(candidate_jobs[0][3])
         if not args.no_project_url:
             open_windows_browser(args.project_url)
         print_manual_help("" if args.no_project_url else args.project_url, prompt_artifact)
@@ -578,64 +1067,124 @@ def main(argv: Sequence[str] | None = None) -> int:
             except FileNotFoundError:
                 pass
         return 2
+    if args.delivery == "pinchtab" and args.fanout_count > 1:
+        print("Pinchtab delivery does not support multi-review fanout. Use `--delivery cdp`.", file=sys.stderr)
+        for temp_path in temp_paths:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+        return 2
 
-    payload_path = write_windows_temp_file(f"codex-chatgpt-payload-{marker_suffix}.txt", bundle_text)
-    windows_output_path = windows_temp_path(f"codex-chatgpt-output-{marker_suffix}.md")
+    completed_code = 0
+    aggregated_text = ""
+    aggregate_meta: dict[str, object] = {}
+    candidate_results: list[ReviewCandidate] = []
     try:
-        if args.delivery == "cdp":
-            completed = run_windows_cdp_chatgpt(
-                payload_path=payload_path,
-                output_path=windows_output_path,
-                project_url="" if args.no_project_url else args.project_url,
+        project_url = "" if args.no_project_url else args.project_url
+        if args.delivery == "cdp" and args.fanout_count > 1:
+            candidate_results = run_windows_cdp_chatgpt_fanout(
+                review_jobs=[(index, label, bundle_text) for index, label, _variant_prompt, bundle_text in candidate_jobs],
+                project_url=project_url,
                 model_label=args.model,
                 model_strategy=args.model_strategy,
                 timeout_ms=args.timeout_ms,
-                begin_marker=begin_marker,
-                end_marker=end_marker,
                 debug_url=args.cdp_debug_url,
                 marker_suffix=marker_suffix,
             )
         else:
-            completed = run_windows_chatgpt(
-                payload_path=payload_path,
-                output_path=windows_output_path,
-                project_url="" if args.no_project_url else args.project_url,
-                model_label=args.model,
-                model_strategy=args.model_strategy,
-                timeout_ms=args.timeout_ms,
-                begin_marker=begin_marker,
-                end_marker=end_marker,
+            index, label, _variant_prompt, bundle_text = candidate_jobs[0]
+            payload_path = write_windows_temp_file(f"codex-chatgpt-payload-{marker_suffix}.txt", bundle_text)
+            windows_output_path = windows_temp_path(f"codex-chatgpt-output-{marker_suffix}.md")
+            try:
+                if args.delivery == "cdp":
+                    completed = run_windows_cdp_chatgpt(
+                        payload_path=payload_path,
+                        output_path=windows_output_path,
+                        project_url=project_url,
+                        model_label=args.model,
+                        model_strategy=args.model_strategy,
+                        timeout_ms=args.timeout_ms,
+                        begin_marker=f"BEGIN_CDX_REVIEW_{marker_suffix}_01",
+                        end_marker=f"END_CDX_REVIEW_{marker_suffix}_01",
+                        debug_url=args.cdp_debug_url,
+                        marker_suffix=marker_suffix,
+                        prefer_new_page=True,
+                    )
+                else:
+                    completed = run_windows_chatgpt(
+                        payload_path=payload_path,
+                        output_path=windows_output_path,
+                        project_url=project_url,
+                        model_label=args.model,
+                        model_strategy=args.model_strategy,
+                        timeout_ms=args.timeout_ms,
+                        begin_marker=f"BEGIN_CDX_REVIEW_{marker_suffix}_01",
+                        end_marker=f"END_CDX_REVIEW_{marker_suffix}_01",
+                    )
+                stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
+                stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
+                review_text = ""
+                for _ in range(10):
+                    if windows_output_path.exists() and windows_output_path.stat().st_size > 0:
+                        review_text = windows_output_path.read_text(encoding="utf-8", errors="replace")
+                        break
+                    time.sleep(0.5)
+                if not review_text.strip():
+                    review_text = stdout_text.strip()
+                metadata: dict[str, object] = {}
+                if stdout_text.strip():
+                    try:
+                        loaded = json.loads(stdout_text.strip().splitlines()[-1])
+                    except json.JSONDecodeError:
+                        loaded = {}
+                    if isinstance(loaded, dict):
+                        metadata = loaded
+                candidate_results = [
+                    ReviewCandidate(
+                        index=index,
+                        label=label,
+                        prompt_text=bundle_text,
+                        review_text=review_text,
+                        output_path=windows_output_path,
+                        returncode=completed.returncode,
+                        stdout_text=stdout_text,
+                        stderr_text=stderr_text,
+                        metadata=metadata,
+                    )
+                ]
+            finally:
+                try:
+                    payload_path.unlink(missing_ok=True)
+                except TypeError:
+                    if payload_path.exists():
+                        payload_path.unlink()
+                try:
+                    windows_output_path.unlink(missing_ok=True)
+                except TypeError:
+                    if windows_output_path.exists():
+                        windows_output_path.unlink()
+
+        successful_candidates = [candidate for candidate in candidate_results if candidate.returncode == 0 and candidate.review_text.strip()]
+        if not successful_candidates:
+            completed_code = 1
+        else:
+            aggregated_text, aggregate_meta = aggregate_review_candidates(successful_candidates)
+            write_output.parent.mkdir(parents=True, exist_ok=True)
+            write_output.write_text(aggregated_text, encoding="utf-8")
+            completed_code = 0
+        write_candidate_artifacts(candidate_dir, candidate_results, aggregate_meta)
+        for candidate in candidate_results:
+            status = "ok" if candidate.returncode == 0 and candidate.review_text.strip() else f"failed({candidate.returncode})"
+            print(f"[candidate {candidate.index:02d}] {candidate.label}: {status}")
+            if candidate.stderr_text.strip():
+                print(candidate.stderr_text.strip(), file=sys.stderr)
+        if aggregate_meta:
+            print(
+                f"Selected review: candidate {int(aggregate_meta.get('selected_candidate', 0)):02d} "
+                f"[{aggregate_meta.get('selected_label', '')}] via {aggregate_meta.get('mode', '')}"
             )
-        completed_code = completed.returncode
-        stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
-        stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
-        if stdout_text:
-            print(stdout_text.strip())
-        if stderr_text:
-            print(stderr_text.strip(), file=sys.stderr)
-        if completed_code == 0:
-            review_text = ""
-            for _ in range(10):
-                if windows_output_path.exists() and windows_output_path.stat().st_size > 0:
-                    review_text = windows_output_path.read_text(encoding="utf-8", errors="replace")
-                    break
-                time.sleep(0.5)
-            if not review_text.strip():
-                review_text = stdout_text
-            if review_text is not None:
-                write_output.parent.mkdir(parents=True, exist_ok=True)
-                write_output.write_text(review_text, encoding="utf-8")
     finally:
-        try:
-            payload_path.unlink(missing_ok=True)
-        except TypeError:
-            if payload_path.exists():
-                payload_path.unlink()
-        try:
-            windows_output_path.unlink(missing_ok=True)
-        except TypeError:
-            if windows_output_path.exists():
-                windows_output_path.unlink()
         for temp_path in temp_paths:
             try:
                 os.unlink(temp_path)

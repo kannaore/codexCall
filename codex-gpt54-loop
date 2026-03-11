@@ -18,6 +18,8 @@ DEFAULT_REVIEW_MODEL_STRATEGY = "select"
 DEFAULT_REVIEW_DELIVERY = "cdp"
 DEFAULT_REVIEW_MODE = "diff"
 DEFAULT_REVIEW_TIMEOUT_MS = 900000
+DEFAULT_REVIEW_FANOUT_COUNT = 5
+DEFAULT_REVIEW_FANOUT_STRATEGY = "angled"
 
 
 @dataclass
@@ -222,10 +224,51 @@ def bullet_block(title: str, items: Sequence[str]) -> str:
     return title + "\n" + "\n".join(f"- {item}" for item in items)
 
 
-def build_follow_up_prompt(review: ReviewDecision) -> str:
+def review_candidate_manifest_path(review_path: Path) -> Path:
+    return review_path.parent / f"{review_path.name}.candidates" / "manifest.json"
+
+
+def load_review_candidate_manifest(review_path: Path) -> dict[str, Any] | None:
+    manifest_path = review_candidate_manifest_path(review_path)
+    if not manifest_path.exists():
+        return None
+    try:
+        loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    return loaded
+
+
+def build_follow_up_prompt(review: ReviewDecision, candidate_manifest: dict[str, Any] | None = None) -> str:
     parts = [
         "다음은 웹 ChatGPT의 코드 리뷰 결과다. 실제 코드와 대조해서 타당한 지적만 반영하고 수정해라.",
     ]
+    aggregate = candidate_manifest.get("aggregate") if isinstance(candidate_manifest, dict) else None
+    if isinstance(aggregate, dict):
+        candidate_count = aggregate.get("valid_candidate_count")
+        revise_count = aggregate.get("revise_count")
+        selected_candidate = aggregate.get("selected_candidate")
+        selected_label = str(aggregate.get("selected_label", "")).strip()
+        selected_review_path = str(aggregate.get("selected_review_path", "")).strip()
+        selected_prompt_path = str(aggregate.get("selected_prompt_path", "")).strip()
+        summary_bits: list[str] = []
+        if candidate_count not in {None, ""}:
+            summary_bits.append(f"유효 리뷰 {candidate_count}개")
+        if revise_count not in {None, ""}:
+            summary_bits.append(f"revise {revise_count}개")
+        if selected_candidate not in {None, ""}:
+            if selected_label:
+                summary_bits.append(f"선택 후보 {int(selected_candidate):02d} [{selected_label}]")
+            else:
+                summary_bits.append(f"선택 후보 {int(selected_candidate):02d}")
+        if summary_bits:
+            parts.append("병렬 리뷰 취합:\n- " + "\n- ".join(summary_bits))
+        if selected_review_path:
+            parts.append(f"선택된 저장 리뷰: {selected_review_path}")
+        if selected_prompt_path:
+            parts.append(f"선택 후보 프롬프트: {selected_prompt_path}")
     if review.summary:
         parts.append(f"요약: {review.summary}")
     must_fix_block = bullet_block("반드시 고칠 것:", review.must_fix)
@@ -373,6 +416,10 @@ def run_review_round(
         args.review_model_strategy,
         "--timeout-ms",
         str(args.review_timeout_ms),
+        "--fanout-count",
+        str(args.review_fanout_count),
+        "--fanout-strategy",
+        args.review_fanout_strategy,
     ]
     if args.cdp_debug_url:
         command.extend(["--cdp-debug-url", args.cdp_debug_url])
@@ -457,6 +504,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default=DEFAULT_REVIEW_TIMEOUT_MS,
         help="Timeout passed to the ChatGPT review runner.",
     )
+    parser.add_argument(
+        "--review-fanout-count",
+        type=int,
+        default=DEFAULT_REVIEW_FANOUT_COUNT,
+        help="How many parallel ChatGPT review tabs to run each round.",
+    )
+    parser.add_argument(
+        "--review-fanout-strategy",
+        default=DEFAULT_REVIEW_FANOUT_STRATEGY,
+        choices=["angled", "identical"],
+        help="How the parallel ChatGPT review prompts should differ.",
+    )
     parser.add_argument("--review-file", action="append", default=[], dest="review_files", help="Extra file to attach to every review round.")
     parser.add_argument("--include-untracked", action="store_true", help="Include untracked files in review rounds.")
     parser.add_argument("--project-url", default=None, help="Override the ChatGPT project URL for review rounds.")
@@ -469,6 +528,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     if args.max_rounds < 1:
         print("--max-rounds must be at least 1.", file=sys.stderr)
+        return 2
+    if args.review_fanout_count < 1:
+        print("--review-fanout-count must be at least 1.", file=sys.stderr)
         return 2
     if args.codex_full_auto and args.codex_bypass_approvals:
         print("Choose either --codex-full-auto or --codex-bypass-approvals, not both.", file=sys.stderr)
@@ -539,6 +601,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 session_dir=session_dir,
                 args=args,
             )
+            candidate_manifest = load_review_candidate_manifest(review_path)
+            aggregate = candidate_manifest.get("aggregate") if isinstance(candidate_manifest, dict) else {}
+            candidate_manifest_path = review_candidate_manifest_path(review_path)
             round_record.update(
                 {
                     "status": review.verdict,
@@ -549,6 +614,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "must_fix": review.must_fix,
                     "risks": review.risks,
                     "tests": review.tests,
+                    "review_candidate_manifest": str(candidate_manifest_path) if candidate_manifest_path.exists() else None,
+                    "review_selected_candidate": aggregate.get("selected_candidate") if isinstance(aggregate, dict) else None,
+                    "review_selected_label": aggregate.get("selected_label") if isinstance(aggregate, dict) else None,
+                    "review_selected_review_path": aggregate.get("selected_review_path") if isinstance(aggregate, dict) else None,
                 }
             )
             write_manifest(manifest_path, manifest)
@@ -568,7 +637,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"[round {round_index}] stopped by user before sending follow-up to Codex.")
                 break
 
-            next_prompt = build_follow_up_prompt(review)
+            next_prompt = build_follow_up_prompt(review, candidate_manifest)
+            follow_up_path = session_dir / f"round-{round_index:02d}.followup.md"
+            write_text(follow_up_path, next_prompt)
+            round_record["follow_up_prompt_path"] = str(follow_up_path)
+            write_manifest(manifest_path, manifest)
         else:
             manifest["status"] = "max-rounds"
     except Exception as exc:  # noqa: BLE001

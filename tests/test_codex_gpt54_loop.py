@@ -72,6 +72,36 @@ class PromptFormattingTests(unittest.TestCase):
         self.assertIn("리뷰어 후속 지시:", prompt)
         self.assertNotIn("추가 리스크:", prompt)
 
+    def test_build_follow_up_prompt_includes_selected_review_artifacts(self):
+        review = loop.ReviewDecision(
+            verdict="revise",
+            summary="예외 처리 누락",
+            must_fix=["timeout 예외 처리 추가"],
+            risks=[],
+            tests=[],
+            follow_up_prompt="timeout 실패 분기를 구현해라",
+            raw={},
+        )
+        candidate_manifest = {
+            "aggregate": {
+                "selected_candidate": 2,
+                "selected_label": "02-edge-cases",
+                "valid_candidate_count": 5,
+                "revise_count": 4,
+                "selected_review_path": "/tmp/review-02.txt",
+                "selected_prompt_path": "/tmp/review-02.prompt.md",
+            }
+        }
+
+        prompt = loop.build_follow_up_prompt(review, candidate_manifest)
+
+        self.assertIn("병렬 리뷰 취합:", prompt)
+        self.assertIn("유효 리뷰 5개", prompt)
+        self.assertIn("revise 4개", prompt)
+        self.assertIn("선택 후보 02 [02-edge-cases]", prompt)
+        self.assertIn("선택된 저장 리뷰: /tmp/review-02.txt", prompt)
+        self.assertIn("선택 후보 프롬프트: /tmp/review-02.prompt.md", prompt)
+
     def test_build_review_prompt_embeds_task_and_note(self):
         prompt = loop.build_review_prompt("로그인 버그 수정", "세션 만료 케이스를 특히 봐라")
 
@@ -151,6 +181,62 @@ class GitFilteringTests(unittest.TestCase):
 
 
 class MainLoopTests(unittest.TestCase):
+    def test_run_review_round_forwards_fanout_options(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo_root = Path(tempdir)
+            session_dir = repo_root / "session"
+            session_dir.mkdir(parents=True, exist_ok=True)
+            review_path = session_dir / "round-01.review.json"
+            review_path.write_text(
+                json.dumps(
+                    {
+                        "verdict": "pass",
+                        "summary": "문제 없음",
+                        "must_fix": [],
+                        "risks": [],
+                        "tests": [],
+                        "follow_up_prompt": "",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                review_mode="diff",
+                include_untracked=False,
+                review_delivery="cdp",
+                review_model="ChatGPT 5.4 Pro",
+                review_model_strategy="select",
+                review_timeout_ms=123456,
+                review_fanout_count=5,
+                review_fanout_strategy="angled",
+                cdp_debug_url="http://127.0.0.1:9999",
+                no_project_url=False,
+                project_url="https://chatgpt.com/g/project",
+                review_files=["docs/spec.md"],
+                review_note="",
+            )
+
+            with patch.object(loop, "has_untracked_files", return_value=False), patch.object(
+                loop,
+                "run_command",
+                return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ) as run_command:
+                review, _review_path = loop.run_review_round(
+                    repo_root=repo_root,
+                    round_index=1,
+                    task="로그인 버그 수정",
+                    session_dir=session_dir,
+                    args=args,
+                )
+
+            self.assertEqual(review.verdict, "pass")
+            command = run_command.call_args.args[0]
+            self.assertIn("--fanout-count", command)
+            self.assertIn("5", command)
+            self.assertIn("--fanout-strategy", command)
+            self.assertIn("angled", command)
+
     def test_main_stops_after_pass_review_and_writes_manifest(self):
         with tempfile.TemporaryDirectory() as tempdir:
             repo_root = Path(tempdir)
@@ -189,6 +275,26 @@ class MainLoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             repo_root = Path(tempdir)
             session_dir = repo_root / "session"
+            review_path = session_dir / "round-01.review.json"
+            candidate_dir = session_dir / "round-01.review.json.candidates"
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            (candidate_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "aggregate": {
+                            "selected_candidate": 2,
+                            "selected_label": "02-edge-cases",
+                            "valid_candidate_count": 5,
+                            "revise_count": 5,
+                            "selected_review_path": str(candidate_dir / "candidate-02-02-edge-cases.txt"),
+                            "selected_prompt_path": str(candidate_dir / "candidate-02-02-edge-cases.prompt.md"),
+                        },
+                        "candidates": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             review = loop.ReviewDecision(
                 verdict="revise",
                 summary="예외 경로 누락",
@@ -207,7 +313,7 @@ class MainLoopTests(unittest.TestCase):
             with patch.object(loop, "detect_repo_root", return_value=repo_root), patch.object(
                 loop, "run_codex_round", side_effect=fake_run_codex_round
             ), patch.object(loop, "has_repo_changes", return_value=True), patch.object(
-                loop, "run_review_round", return_value=(review, session_dir / "round-01.review.json")
+                loop, "run_review_round", return_value=(review, review_path)
             ):
                 exit_code = loop.main(
                     [
@@ -224,6 +330,8 @@ class MainLoopTests(unittest.TestCase):
             self.assertEqual(exit_code, 3)
             self.assertEqual(len(prompts), 2)
             self.assertEqual(prompts[0], "파일 업로드 race condition 수정")
+            self.assertIn("병렬 리뷰 취합:", prompts[1])
+            self.assertIn("선택 후보 02 [02-edge-cases]", prompts[1])
             self.assertIn("반드시 고칠 것:", prompts[1])
             self.assertIn("timeout 예외 처리 추가", prompts[1])
             self.assertIn("리뷰어 후속 지시:", prompts[1])
@@ -233,6 +341,9 @@ class MainLoopTests(unittest.TestCase):
             self.assertEqual(len(manifest["rounds"]), 2)
             self.assertEqual(manifest["rounds"][0]["status"], "revise")
             self.assertEqual(manifest["rounds"][1]["status"], "revise")
+            self.assertEqual(manifest["rounds"][0]["review_selected_candidate"], 2)
+            self.assertTrue(manifest["rounds"][0]["review_selected_review_path"].endswith("candidate-02-02-edge-cases.txt"))
+            self.assertTrue((session_dir / "round-01.followup.md").exists())
 
     def test_main_skips_review_when_codex_makes_no_changes(self):
         with tempfile.TemporaryDirectory() as tempdir:
