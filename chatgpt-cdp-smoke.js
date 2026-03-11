@@ -39,16 +39,17 @@ async function main() {
     preferNewPage = false,
     prepareOnly = false,
     inspectExistingReviewsOnly = false,
+    recoverExistingOnly = false,
   } = config;
 
   if (!debugUrl) {
     throw new Error("Missing required config fields.");
   }
-  if (!prepareOnly && !inspectExistingReviewsOnly && (!payloadPath || !outputPath || !beginMarker || !endMarker)) {
+  if (!prepareOnly && !inspectExistingReviewsOnly && (!outputPath || !beginMarker || !endMarker || (!recoverExistingOnly && !payloadPath))) {
     throw new Error("Missing required config fields.");
   }
 
-  const payload = prepareOnly || inspectExistingReviewsOnly ? "" : fs.readFileSync(payloadPath, "utf8");
+  const payload = prepareOnly || inspectExistingReviewsOnly || recoverExistingOnly ? "" : fs.readFileSync(payloadPath, "utf8");
   const playwright = loadPlaywright();
   const browser = await playwright.chromium.connectOverCDP(debugUrl, { timeout: connectTimeoutMs });
 
@@ -321,12 +322,16 @@ async function main() {
     let beginCount = 0;
     let endCount = 0;
     let hasCompleteMarkers = false;
+    let hasPendingMarkers = false;
     for (const [marker, count] of markerCounts.entries()) {
       if (marker.startsWith("BEGIN_CDX_REVIEW_")) {
         beginCount += count;
         const endMarker = marker.replace("BEGIN_CDX_REVIEW_", "END_CDX_REVIEW_");
-        if (count >= 2 && (markerCounts.get(endMarker) || 0) >= 2) {
+        const endCountForMarker = markerCounts.get(endMarker) || 0;
+        if (count >= 2 && endCountForMarker >= 2) {
           hasCompleteMarkers = true;
+        } else if (count > 0 || endCountForMarker > 0) {
+          hasPendingMarkers = true;
         }
       } else if (marker.startsWith("END_CDX_REVIEW_")) {
         endCount += count;
@@ -336,7 +341,9 @@ async function main() {
     const isGenerating = isResponseGenerating(body);
     let state = "none";
     if (hasMarkers) {
-      if (hasCompleteMarkers) {
+      if (hasPendingMarkers) {
+        state = isGenerating ? "pending" : "incomplete";
+      } else if (hasCompleteMarkers) {
         state = "complete";
       } else if (isGenerating) {
         state = "pending";
@@ -349,9 +356,25 @@ async function main() {
       endCount,
       hasMarkers,
       hasCompleteMarkers,
+      hasPendingMarkers,
       isGenerating,
       state,
     };
+  }
+
+  async function findMatchingReviewPage(pages, projectUrl, beginMarker, endMarker) {
+    for (const candidate of pages) {
+      const url = candidate.url() || "";
+      if (!pageMatchesProjectScope(url, projectUrl)) {
+        continue;
+      }
+      const text = await candidate.locator("body").innerText().catch(() => "");
+      const markerState = analyzeReviewMarkers(text, beginMarker, endMarker);
+      if (markerState.beginCount > 0 || markerState.endCount > 0 || markerState.review !== null) {
+        return { page: candidate, markerState };
+      }
+    }
+    return null;
   }
 
   async function injectPromptViaDom(editor, payloadText) {
@@ -551,7 +574,32 @@ async function main() {
       sourcePage = pages[0] || null;
     }
 
-    if (preferNewPage) {
+    let existingReviewMatch = null;
+    if (!prepareOnly && !inspectExistingReviewsOnly && beginMarker && endMarker) {
+      existingReviewMatch = await findMatchingReviewPage(pages, projectUrl, beginMarker, endMarker);
+      if (existingReviewMatch && existingReviewMatch.markerState.review !== null) {
+        fs.writeFileSync(outputPath, existingReviewMatch.markerState.review, "utf8");
+        console.log(
+          JSON.stringify({
+            ok: true,
+            recovered: true,
+            url: existingReviewMatch.page.url(),
+            pages: pageSummaries,
+            outputPath,
+            reviewLength: existingReviewMatch.markerState.review.length,
+            reviewPreview: existingReviewMatch.markerState.review.slice(0, 200),
+          }),
+        );
+        return;
+      }
+    }
+    if (recoverExistingOnly && !existingReviewMatch) {
+      throw new Error(`No existing ChatGPT review tab matched markers for recovery in ${projectUrl || "the current project scope"}.`);
+    }
+
+    if (existingReviewMatch && (existingReviewMatch.markerState.beginCount > 0 || existingReviewMatch.markerState.endCount > 0)) {
+      page = existingReviewMatch.page;
+    } else if (preferNewPage) {
       page = await context.newPage();
     } else {
       page = sourcePage || (await context.newPage());
@@ -591,11 +639,13 @@ async function main() {
       return;
     }
 
-    const editor = page.locator("#prompt-textarea").first();
-    await editor.waitFor({ timeout: 20000 });
-    await uploadAttachments(page, attachmentPaths);
-    await injectPrompt(page, editor, payload);
-    await submitPrompt(page, editor);
+    if (!recoverExistingOnly && !(existingReviewMatch && (existingReviewMatch.markerState.beginCount > 0 || existingReviewMatch.markerState.endCount > 0))) {
+      const editor = page.locator("#prompt-textarea").first();
+      await editor.waitFor({ timeout: 20000 });
+      await uploadAttachments(page, attachmentPaths);
+      await injectPrompt(page, editor, payload);
+      await submitPrompt(page, editor);
+    }
 
     const started = Date.now();
     let lastMarkerState = {

@@ -69,7 +69,7 @@ class DiffPayloadTests(unittest.TestCase):
                 return " M codex-gpt54-review\n M tests/test_codex_gpt54_review.py"
             return "(none)"
 
-        with patch.object(review, "run_command", side_effect=fake_run_command):
+        with patch.object(review.repo_context_mod, "run_command", side_effect=fake_run_command):
             payload = review.build_diff_payload(repo_root, rel_paths)
 
         self.assertIn("codex-gpt54-review", payload)
@@ -84,7 +84,7 @@ class DiffPayloadTests(unittest.TestCase):
         )
 
     def test_build_diff_payload_reports_when_no_reviewable_files_changed(self):
-        with patch.object(review, "run_command") as run_command:
+        with patch.object(review.repo_context_mod, "run_command") as run_command:
             payload = review.build_diff_payload(Path("/tmp/repo"), [])
 
         self.assertIn("(no reviewable changed files)", payload)
@@ -99,7 +99,7 @@ class DiffPayloadTests(unittest.TestCase):
             seen_commands.append(list(args))
             return "ok"
 
-        with patch.object(review, "run_command", side_effect=fake_run_command):
+        with patch.object(review.repo_context_mod, "run_command", side_effect=fake_run_command):
             status_text = review.build_review_status_text(repo_root, rel_paths)
             diff_stat = review.build_review_diff_stat(repo_root, rel_paths)
 
@@ -116,7 +116,7 @@ class DiffPayloadTests(unittest.TestCase):
     def test_collect_review_git_paths_keeps_deletes_and_filters_internal_artifacts(self):
         repo_root = Path("/tmp/repo")
         with patch.object(
-            review,
+            review.repo_context_mod,
             "gather_changed_git_paths",
             return_value=["app.py", "old.py", ".oracle-reviews/manifest.json", "__pycache__/x.pyc"],
         ):
@@ -134,18 +134,27 @@ class DiffPayloadTests(unittest.TestCase):
 
         def fake_run_command(args, cwd):
             if args == ["git", "ls-files"]:
-                return "app.py\nREADME.md\n.oracle-reviews/manifest.json"
+                return "app.py\nREADME.md\n.oracle-reviews/manifest.json\n.oracle-bridge-token"
             if args == ["git", "ls-files", "--others", "--exclude-standard"]:
                 return "notes.md\n__pycache__/junk.pyc"
             raise AssertionError(args)
 
-        with patch.object(review, "run_command", side_effect=fake_run_command):
+        with patch.object(review.repo_context_mod, "run_command", side_effect=fake_run_command):
             rel_paths = review.gather_repo_snapshot_paths(repo_root, include_untracked=True)
 
         self.assertEqual(rel_paths, ["app.py", "README.md", "notes.md"])
 
+    def test_sensitive_snapshot_paths_are_excluded(self):
+        self.assertTrue(review.is_sensitive_snapshot_relpath(".oracle-bridge-token"))
+        self.assertTrue(review.is_sensitive_snapshot_relpath(".env.local"))
+        self.assertTrue(review.is_sensitive_snapshot_relpath("secrets/dev.pem"))
+        self.assertFalse(review.is_sensitive_snapshot_relpath("src/app.py"))
+
 
 class ReviewAggregationTests(unittest.TestCase):
+    def test_consensus_threshold_requires_strict_majority_for_even_counts(self):
+        self.assertEqual(review.consensus_threshold(4), 3)
+
     def make_candidate(self, index: int, label: str, payload: dict[str, object]) -> object:
         return review.ReviewCandidate(
             index=index,
@@ -349,15 +358,31 @@ class ReviewArtifactResetTests(unittest.TestCase):
 
 
 class SnapshotArchiveTests(unittest.TestCase):
-    def test_resolve_attachment_format_prefers_repo_zip_for_large_inline_payloads(self):
+    def test_resolve_attachment_format_prefers_text_for_small_inline_payloads(self):
         with tempfile.TemporaryDirectory() as tempdir:
-            big_file = Path(tempdir) / "big.py"
-            big_file.write_text("x" * (review.SNAPSHOT_INLINE_CHAR_THRESHOLD + 1), encoding="utf-8")
+            small_file = Path(tempdir) / "small.py"
+            small_file.write_text("print('ok')\n", encoding="utf-8")
 
             attachment_format = review.resolve_attachment_format(
                 "auto",
                 delivery="cdp",
-                inline_attachments=[big_file],
+                inline_attachments=[small_file],
+            )
+
+        self.assertEqual(attachment_format, "text")
+
+    def test_resolve_attachment_format_prefers_repo_zip_for_large_inline_payloads(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            big_files = []
+            for index in range(4):
+                big_file = Path(tempdir) / f"big-{index}.py"
+                big_file.write_text("x" * 1000, encoding="utf-8")
+                big_files.append(big_file)
+
+            attachment_format = review.resolve_attachment_format(
+                "auto",
+                delivery="cdp",
+                inline_attachments=big_files,
             )
 
         self.assertEqual(attachment_format, "repo-zip")
@@ -369,18 +394,19 @@ class SnapshotArchiveTests(unittest.TestCase):
             (repo_root / "pkg").mkdir()
             (repo_root / "pkg" / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
 
-            archive_path = review.create_repo_snapshot_archive(
-                repo_root=repo_root,
-                branch="main",
-                prompt_text="리뷰해라",
-                context_text="# Context\n",
-                selected_files=[],
-                review_git_paths=["app.py", "deleted.py"],
-                repo_snapshot_paths=["app.py", "pkg/mod.py"],
-                status_text=" M app.py\n D deleted.py",
-                diff_stat=" app.py | 1 +",
-                diff_payload="# Diff\n",
-            )
+            with patch.object(review.bundles_mod, "gather_changed_git_paths", return_value=["app.py", ".oracle-bridge-token"]):
+                archive_path = review.create_repo_snapshot_archive(
+                    repo_root=repo_root,
+                    branch="main",
+                    prompt_text="리뷰해라",
+                    context_text="# Context\n",
+                    selected_files=[],
+                    review_git_paths=["app.py", "deleted.py"],
+                    repo_snapshot_paths=["app.py", "pkg/mod.py"],
+                    status_text=" M app.py\n D deleted.py",
+                    diff_stat=" app.py | 1 +",
+                    diff_payload="# Diff\n",
+                )
             try:
                 import zipfile
 
@@ -395,6 +421,7 @@ class SnapshotArchiveTests(unittest.TestCase):
                     manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
                     self.assertEqual(manifest["deleted_paths"], ["deleted.py"])
                     self.assertEqual(manifest["repo_snapshot_paths"], ["app.py", "pkg/mod.py"])
+                    self.assertIn("excluded_sensitive_paths", manifest)
             finally:
                 archive_path.unlink(missing_ok=True)
 
@@ -446,6 +473,39 @@ class CleanupHelperTests(unittest.TestCase):
 
 
 class CDPReviewRunnerTests(unittest.TestCase):
+    def test_recover_existing_windows_cdp_candidates_reads_prompt_markers_and_uses_recovery_mode(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+            candidate_dir = base / "review.json.candidates"
+            candidate_dir.mkdir(parents=True, exist_ok=True)
+            prompt_path = candidate_dir / "candidate-01-01-regression.prompt.md"
+            prompt_path.write_text(
+                "BEGIN_CDX_REVIEW_ABC_01\nEND_CDX_REVIEW_ABC_01\n",
+                encoding="utf-8",
+            )
+
+            def fake_run_windows_cdp_chatgpt(**kwargs):
+                output_path = kwargs["output_path"]
+                assert output_path is not None
+                output_path.write_text("{\"verdict\":\"pass\"}", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout=b'{"recovered":true}', stderr=b"")
+
+            with patch.object(review, "run_windows_cdp_chatgpt", side_effect=fake_run_windows_cdp_chatgpt) as runner:
+                candidates = review.recover_existing_windows_cdp_candidates(
+                    candidate_dir=candidate_dir,
+                    project_url="https://chatgpt.com/g/project",
+                    model_label="ChatGPT 5.4 Pro",
+                    timeout_ms=3600000,
+                    debug_url="http://127.0.0.1:9870",
+                    marker_suffix="recover",
+                )
+
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0].index, 1)
+            self.assertEqual(candidates[0].label, "01-regression")
+            self.assertEqual(candidates[0].review_text, '{"verdict":"pass"}')
+            self.assertTrue(runner.call_args.kwargs["recover_existing_only"])
+
     def test_inspect_windows_cdp_reviews_uses_inspection_mode(self):
         with patch.object(
             review,

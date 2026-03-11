@@ -1,0 +1,37 @@
+핵심 피드백
+
+가장 큰 문제는 기본 --attachment-format auto가 CDP에서 사실상 항상 repo-zip으로 가고, zip 대상도 git ls-files 전체라는 점입니다. 이 리뷰에 올라온 snapshot에도 실제로 repo/.oracle-bridge-token이 포함돼 있습니다. 기본 동작만으로 토큰/숨김 파일을 외부로 업로드하는 회귀라서 must-fix입니다.
+
+consensus_threshold() 구현이 짝수 fanout에서 잘못됐습니다. 지금은 과반이 아니라 “절반”만 요구해서, fanout-count=4에서 2 pass / 2 revise tie도 곧바로 revise로 확정됩니다. required_valid_candidate_count도 2가 되어 4개 중 2개 valid만 있어도 성공 처리됩니다.
+
+chatgpt-cdp-smoke.js의 analyzeExistingReviewPage()는 페이지 전체 marker 개수만 보고 complete를 판정합니다. 이전 완료 리뷰가 같은 탭에 남아 있으면, 새 pending 리뷰가 있어도 begin>=2 && end>=2 때문에 complete로 오판해서 동시 실행 차단이 무력화됩니다.
+
+리스크
+
+auto 기본값이 사실상 “항상 zip 업로드”라서, 파일 업로드 UI 변경/권한 이슈/인덱싱 지연이 있으면 작은 diff 리뷰도 전부 실패합니다. 기존 텍스트 기반보다 실패면이 크게 넓어졌습니다.
+
+전체 repo zip + fanout(기본 5) + waitForAttachmentNames(..., 30000) 조합은 큰 저장소에서 timeout/false negative를 내기 쉽습니다.
+
+SNAPSHOT_INLINE_CHAR_THRESHOLD와 estimate_inline_attachment_chars()가 선언돼 있는데 auto 결정에 전혀 쓰이지 않습니다. 설계 의도와 실제 동작이 이미 어긋나 있습니다.
+
+테스트 보강
+
+resolve_attachment_format("auto")의 소형 payload 케이스를 추가해야 합니다. 지금은 큰 payload만 테스트해서 “항상 repo-zip” 버그를 못 잡습니다.
+
+snapshot archive 테스트에 민감 파일/숨김 파일 제외 케이스를 넣어야 합니다. 최소 .oracle-bridge-token, .env, 키 파일 패턴은 막아야 합니다.
+
+집계 로직은 짝수 fanout 케이스가 빠졌습니다. 2/2, 3/3 tie와 “4개 중 2개만 valid” 케이스를 넣어야 합니다.
+
+review-tab inspection은 JS 로직 자체 테스트가 없습니다. “이전 complete + 현재 pending” 본문에서 pending으로 판정되는지 검증이 필요합니다.
+
+추가된 CDP runner 테스트는 checkout 경로에 묶여 있습니다. 스냅샷 그대로 pytest -q를 돌리면 3개가 /home/mrcorp/Coding/Tools/호출기/chatgpt-cdp-smoke.js 절대경로 의존성 때문에 깨집니다.
+
+바로 고칠 것
+
+auto는 정말 auto로 바꾸세요. 기본은 text, inline 크기가 threshold를 넘을 때만 repo-zip으로 올리고, zip 대상도 review scope + diff 중심으로 줄이세요. 동시에 민감 파일 denylist/allowlist를 넣어야 합니다.
+
+consensus_threshold()를 count // 2 + 1로 바꾸고, tie는 무조건 no-consensus로 처리하세요.
+
+analyzeExistingReviewPage()는 전체 count가 아니라 “마지막 review run의 marker pair가 완성됐는지”를 보도록 다시 작성하세요.
+
+chatgpt-cdp-smoke.js 로딩 경로는 절대경로가 아니라 스크립트 기준 상대경로로 바꾸고, 테스트도 그 resolver를 mock하도록 정리하세요.
