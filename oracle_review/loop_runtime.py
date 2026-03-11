@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +22,9 @@ DEFAULT_REVIEW_MODE = "diff"
 DEFAULT_REVIEW_TIMEOUT_MS = DEFAULT_TIMEOUT_MS
 DEFAULT_REVIEW_FANOUT_COUNT = DEFAULT_FANOUT_COUNT
 DEFAULT_REVIEW_FANOUT_STRATEGY = DEFAULT_FANOUT_STRATEGY
+DEFAULT_CODEX_HOME_FILES = ("auth.json", "config.toml", "AGENTS.md", "version.json", ".personality_migration")
+DEFAULT_CODEX_HOME_DIRS = ("skills",)
+DEFAULT_CODEX_HOME_RUNTIME_DIRS = ("shell_snapshots",)
 
 
 def run_command(
@@ -27,6 +32,7 @@ def run_command(
     *,
     cwd: Path | None = None,
     input_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(args),
@@ -35,6 +41,7 @@ def run_command(
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
 
 
@@ -65,6 +72,53 @@ def parse_thread_id(jsonl_text: str) -> str:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def codex_home_root() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".codex").resolve()
+
+
+def _link_or_copy_entry(source: Path, target: Path) -> None:
+    if target.exists() or target.is_symlink() or not source.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        try:
+            target.symlink_to(source, target_is_directory=True)
+            return
+        except OSError:
+            shutil.copytree(source, target, dirs_exist_ok=True)
+            return
+    shutil.copy2(source, target)
+
+
+def prepare_codex_home(session_dir: Path, args: argparse.Namespace) -> Path | None:
+    if getattr(args, "codex_shared_home", False):
+        return None
+    if args.codex_session_id or args.codex_resume_last:
+        return None
+
+    source_home = codex_home_root()
+    isolated_home = session_dir / "codex-home"
+    isolated_home.mkdir(parents=True, exist_ok=True)
+    for name in DEFAULT_CODEX_HOME_FILES:
+        _link_or_copy_entry(source_home / name, isolated_home / name)
+    for name in DEFAULT_CODEX_HOME_DIRS:
+        _link_or_copy_entry(source_home / name, isolated_home / name)
+    for name in DEFAULT_CODEX_HOME_RUNTIME_DIRS:
+        (isolated_home / name).mkdir(parents=True, exist_ok=True)
+    return isolated_home
+
+
+def build_codex_env(codex_home: Path | None) -> dict[str, str] | None:
+    if codex_home is None:
+        return None
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    return env
 
 
 def print_review_summary(round_index: int, review: ReviewDecision, review_path: Path) -> None:
@@ -136,6 +190,7 @@ def run_codex_round(
     prompt: str,
     session_dir: Path,
     args: argparse.Namespace,
+    codex_env: dict[str, str] | None = None,
     run_command_impl: Callable[..., Any] = run_command,
     write_text_impl: Callable[[Path, str], None] = write_text,
     build_codex_command_impl: Callable[..., list[str]] = build_codex_command,
@@ -150,7 +205,10 @@ def run_codex_round(
         message_path=message_path,
         args=args,
     )
-    result = run_command_impl(command, cwd=repo_root, input_text=prompt)
+    if codex_env is not None:
+        result = run_command_impl(command, cwd=repo_root, input_text=prompt, env=codex_env)
+    else:
+        result = run_command_impl(command, cwd=repo_root, input_text=prompt)
     write_text_impl(stdout_path, result.stdout)
     write_text_impl(stderr_path, result.stderr)
     if result.returncode != 0:
@@ -289,6 +347,8 @@ def run_loop(
     session_dir = Path(args.session_dir).resolve() if args.session_dir else default_session_dir_impl(repo_root)
     session_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = session_dir / "manifest.json"
+    codex_home = prepare_codex_home(session_dir, args)
+    codex_env = build_codex_env(codex_home)
 
     manifest: dict[str, Any] = {
         "repo_root": str(repo_root),
@@ -299,9 +359,12 @@ def run_loop(
         "thread_id": None,
         "initial_session_id": args.codex_session_id,
         "resume_last": args.codex_resume_last,
+        "codex_home": str(codex_home) if codex_home else None,
         "rounds": [],
     }
     write_manifest_impl(manifest_path, manifest)
+    if codex_home:
+        print(f"Using isolated Codex home: {codex_home}")
 
     thread_id: str | None = None
     next_prompt = task
@@ -316,6 +379,7 @@ def run_loop(
                 prompt=next_prompt,
                 session_dir=session_dir,
                 args=args,
+                codex_env=codex_env,
             )
             manifest["thread_id"] = thread_id
 

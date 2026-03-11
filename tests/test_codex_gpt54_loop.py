@@ -196,6 +196,7 @@ class CommandBuildingTests(unittest.TestCase):
             "codex_bypass_approvals": False,
             "codex_session_id": None,
             "codex_resume_last": False,
+            "codex_shared_home": False,
         }
         payload.update(overrides)
         return SimpleNamespace(**payload)
@@ -227,6 +228,79 @@ class CommandBuildingTests(unittest.TestCase):
 
         self.assertEqual(command[:4], ["codex", "exec", "resume", "--json"])
         self.assertEqual(command[-2:], ["--last", "-"])
+
+
+class CodexHomeIsolationTests(unittest.TestCase):
+    def make_args(self, **overrides):
+        payload = {
+            "codex_session_id": None,
+            "codex_resume_last": False,
+            "codex_shared_home": False,
+        }
+        payload.update(overrides)
+        return SimpleNamespace(**payload)
+
+    def test_prepare_codex_home_copies_minimal_runtime_files(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+            source_home = base / "source-home"
+            session_dir = base / "session"
+            source_home.mkdir(parents=True, exist_ok=True)
+            session_dir.mkdir(parents=True, exist_ok=True)
+            (source_home / "auth.json").write_text('{"token":"x"}', encoding="utf-8")
+            (source_home / "config.toml").write_text("model = 'gpt-5'\n", encoding="utf-8")
+            (source_home / "AGENTS.md").write_text("agents", encoding="utf-8")
+            (source_home / "version.json").write_text('{"version":"1"}', encoding="utf-8")
+            (source_home / "skills").mkdir(parents=True, exist_ok=True)
+            (source_home / "skills" / "README.md").write_text("skill", encoding="utf-8")
+
+            with patch.object(loop.loop_runtime_mod, "codex_home_root", return_value=source_home):
+                isolated_home = loop.prepare_codex_home(session_dir, self.make_args())
+
+            self.assertEqual(isolated_home, session_dir / "codex-home")
+            assert isolated_home is not None
+            self.assertEqual((isolated_home / "auth.json").read_text(encoding="utf-8"), '{"token":"x"}')
+            self.assertEqual((isolated_home / "config.toml").read_text(encoding="utf-8"), "model = 'gpt-5'\n")
+            self.assertTrue((isolated_home / "skills").exists())
+            self.assertTrue((isolated_home / "shell_snapshots").is_dir())
+
+    def test_prepare_codex_home_skips_isolation_for_resume_modes(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            session_dir = Path(tempdir) / "session"
+            session_dir.mkdir(parents=True, exist_ok=True)
+
+            self.assertIsNone(loop.prepare_codex_home(session_dir, self.make_args(codex_session_id="thread-1")))
+            self.assertIsNone(loop.prepare_codex_home(session_dir, self.make_args(codex_resume_last=True)))
+            self.assertIsNone(loop.prepare_codex_home(session_dir, self.make_args(codex_shared_home=True)))
+
+    def test_main_passes_isolated_codex_home_to_codex_round(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+            repo_root = base / "repo"
+            repo_root.mkdir(parents=True, exist_ok=True)
+            session_dir = base / "session"
+            source_home = base / "source-home"
+            source_home.mkdir(parents=True, exist_ok=True)
+            (source_home / "auth.json").write_text("{}", encoding="utf-8")
+            (source_home / "config.toml").write_text("", encoding="utf-8")
+            captured_envs: list[dict[str, str] | None] = []
+
+            def fake_run_codex_round(*, codex_env, **_kwargs):
+                captured_envs.append(codex_env)
+                return "thread-1"
+
+            with patch.object(loop, "detect_repo_root", return_value=repo_root), patch.object(
+                loop.loop_runtime_mod, "codex_home_root", return_value=source_home
+            ), patch.object(loop, "run_codex_round", side_effect=fake_run_codex_round), patch.object(
+                loop, "has_repo_changes", return_value=False
+            ):
+                exit_code = loop.main(["--repo", str(repo_root), "--session-dir", str(session_dir), "테스트 작업"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(captured_envs), 1)
+            self.assertIsNotNone(captured_envs[0])
+            assert captured_envs[0] is not None
+            self.assertEqual(captured_envs[0]["CODEX_HOME"], str(session_dir / "codex-home"))
 
 
 class GitFilteringTests(unittest.TestCase):

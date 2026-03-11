@@ -4,24 +4,20 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Sequence
 
+from .aggregation import aggregate_review_candidates
 from .common import ReviewCandidate
+from .review_windows import safe_unlink
 
 
 def candidate_output_dir(write_output: Path) -> Path:
     return write_output.parent / f"{write_output.name}.candidates"
 
 
-def reset_review_artifacts(
-    write_output: Path,
-    prompt_artifact: Path,
-    candidate_dir: Path,
-    *,
-    safe_unlink_impl: Callable[[Path], None],
-) -> None:
+def reset_review_artifacts(write_output: Path, prompt_artifact: Path, candidate_dir: Path) -> None:
     for path in (write_output, prompt_artifact):
-        safe_unlink_impl(path)
+        safe_unlink(path)
     shutil.rmtree(candidate_dir, ignore_errors=True)
 
 
@@ -31,10 +27,7 @@ def write_candidate_artifacts(
     aggregate_meta: dict[str, object],
 ) -> None:
     candidate_dir.mkdir(parents=True, exist_ok=True)
-    manifest: dict[str, object] = {
-        "aggregate": aggregate_meta,
-        "candidates": [],
-    }
+    manifest: dict[str, object] = {"aggregate": aggregate_meta, "candidates": []}
     selected_entry: dict[str, object] | None = None
     for candidate in candidates:
         review_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.txt"
@@ -80,17 +73,16 @@ def finalize_candidate_results(
     write_output: Path,
     candidate_results: Sequence[ReviewCandidate],
     expected_count: int,
-    aggregate_review_candidates_impl: Callable[..., tuple[str, dict[str, object]]],
-    write_candidate_artifacts_impl: Callable[[Path, Sequence[ReviewCandidate], dict[str, object]], None],
 ) -> tuple[int, dict[str, object]]:
-    successful_candidates = [candidate for candidate in candidate_results if candidate.returncode == 0 and candidate.review_text.strip()]
+    successful_candidates = [
+        candidate
+        for candidate in candidate_results
+        if candidate.returncode == 0 and candidate.review_text.strip()
+    ]
     aggregate_meta: dict[str, object] = {}
-    completed_code = 0
-    if not successful_candidates:
-        completed_code = 1
-    else:
+    if successful_candidates:
         try:
-            aggregated_text, aggregate_meta = aggregate_review_candidates_impl(
+            aggregated_text, aggregate_meta = aggregate_review_candidates(
                 successful_candidates,
                 expected_count=expected_count,
             )
@@ -102,12 +94,26 @@ def finalize_candidate_results(
                 "valid_candidate_count": len(successful_candidates),
             }
             print(str(error), file=sys.stderr)
-            completed_code = 1
         else:
             write_output.parent.mkdir(parents=True, exist_ok=True)
             write_output.write_text(aggregated_text, encoding="utf-8")
-            completed_code = 0
-    write_candidate_artifacts_impl(candidate_dir, candidate_results, aggregate_meta)
+            write_candidate_artifacts(candidate_dir, candidate_results, aggregate_meta)
+            _print_candidate_summary(candidate_results, aggregate_meta)
+            return 0, aggregate_meta
+    write_candidate_artifacts(candidate_dir, candidate_results, aggregate_meta)
+    _print_candidate_summary(candidate_results, aggregate_meta)
+    return 1, aggregate_meta
+
+
+def cleanup_paths(paths: Sequence[Path]) -> None:
+    for path in paths:
+        safe_unlink(path)
+
+
+def _print_candidate_summary(
+    candidate_results: Sequence[ReviewCandidate],
+    aggregate_meta: dict[str, object],
+) -> None:
     for candidate in candidate_results:
         status = "ok" if candidate.returncode == 0 and candidate.review_text.strip() else f"failed({candidate.returncode})"
         print(f"[candidate {candidate.index:02d}] {candidate.label}: {status}")
@@ -118,13 +124,3 @@ def finalize_candidate_results(
             f"Selected review: candidate {int(aggregate_meta.get('selected_candidate', 0)):02d} "
             f"[{aggregate_meta.get('selected_label', '')}] via {aggregate_meta.get('mode', '')}"
         )
-    return completed_code, aggregate_meta
-
-
-def cleanup_paths(
-    paths: Sequence[Path],
-    *,
-    safe_unlink_impl: Callable[[Path], None],
-) -> None:
-    for path in paths:
-        safe_unlink_impl(path)

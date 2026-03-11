@@ -5,7 +5,6 @@ import argparse
 from datetime import datetime
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -88,276 +87,30 @@ resolve_attachment_format = bundles_mod.resolve_attachment_format
 snapshot_member_name = bundles_mod.snapshot_member_name
 create_repo_snapshot_archive = bundles_mod.create_repo_snapshot_archive
 build_bundle_text = bundles_mod.build_bundle_text
+
+write_windows_temp_file = review_windows_mod.write_windows_temp_file
+windows_temp_path = review_windows_mod.windows_temp_path
+safe_unlink = review_windows_mod.safe_unlink
+terminate_process = review_windows_mod.terminate_process
+to_windows_path = review_windows_mod.to_windows_path
+decode_windows_bytes = review_windows_mod.decode_windows_bytes
+run_windows_powershell = review_windows_mod.run_windows_powershell
+run_windows_chatgpt = review_windows_mod.run_windows_chatgpt
+detect_windows_cdp_debug_url = review_windows_mod.detect_windows_cdp_debug_url
+run_windows_cdp_chatgpt = review_windows_mod.run_windows_cdp_chatgpt
+inspect_windows_cdp_reviews = review_windows_mod.inspect_windows_cdp_reviews
+ensure_no_pending_windows_cdp_reviews = review_windows_mod.ensure_no_pending_windows_cdp_reviews
+recover_existing_windows_cdp_candidates = review_windows_mod.recover_existing_windows_cdp_candidates
+prepare_windows_cdp_chatgpt = review_windows_mod.prepare_windows_cdp_chatgpt
+run_windows_cdp_chatgpt_fanout = review_windows_mod.run_windows_cdp_chatgpt_fanout
+copy_to_windows_clipboard = review_windows_mod.copy_to_windows_clipboard
+open_windows_browser = review_windows_mod.open_windows_browser
+
+candidate_output_dir = review_artifacts_mod.candidate_output_dir
+reset_review_artifacts = review_artifacts_mod.reset_review_artifacts
+write_candidate_artifacts = review_artifacts_mod.write_candidate_artifacts
+finalize_candidate_results = review_artifacts_mod.finalize_candidate_results
 cleanup_paths = review_artifacts_mod.cleanup_paths
-
-POWERSHELL_PATH = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-
-
-def write_windows_temp_file(name: str, content: str) -> Path:
-    return review_windows_mod.write_windows_temp_file(
-        name,
-        content,
-        windows_temp_dir=WINDOWS_TEMP_DIR,
-    )
-
-
-def windows_temp_path(name: str) -> Path:
-    return review_windows_mod.windows_temp_path(name, windows_temp_dir=WINDOWS_TEMP_DIR)
-
-
-def safe_unlink(path: Path) -> None:
-    review_windows_mod.safe_unlink(path)
-
-
-def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 5) -> None:
-    review_windows_mod.terminate_process(process, timeout=timeout)
-
-
-def to_windows_path(path: Path) -> str:
-    return review_windows_mod.to_windows_path(path, run_command_impl=run_command)
-
-
-def decode_windows_bytes(data: bytes) -> str:
-    return review_windows_mod.decode_windows_bytes(data)
-
-
-def run_windows_powershell(script_text: str, *, script_name: str) -> subprocess.CompletedProcess[bytes]:
-    return review_windows_mod.run_windows_powershell(
-        script_text,
-        script_name=script_name,
-        powershell_path=POWERSHELL_PATH,
-        write_windows_temp_file_impl=write_windows_temp_file,
-        to_windows_path_impl=to_windows_path,
-        subprocess_run=subprocess.run,
-    )
-
-
-def run_windows_chatgpt(
-    *,
-    payload_path: Path,
-    output_path: Path,
-    project_url: str,
-    model_label: str,
-    model_strategy: str,
-    timeout_ms: int,
-    begin_marker: str,
-    end_marker: str,
-) -> subprocess.CompletedProcess[bytes]:
-    return review_windows_mod.run_windows_chatgpt(
-        payload_path=payload_path,
-        output_path=output_path,
-        project_url=project_url,
-        model_label=model_label,
-        model_strategy=model_strategy,
-        timeout_ms=timeout_ms,
-        begin_marker=begin_marker,
-        end_marker=end_marker,
-        powershell_path=POWERSHELL_PATH,
-        script_path=repo_script_path("chatgpt-windows-run.ps1"),
-        to_windows_path_impl=to_windows_path,
-        subprocess_run=subprocess.run,
-    )
-
-
-def detect_windows_cdp_debug_url() -> str:
-    return review_windows_mod.detect_windows_cdp_debug_url(
-        run_windows_powershell_impl=run_windows_powershell,
-        decode_windows_bytes_impl=decode_windows_bytes,
-    )
-
-
-def _cdp_driver_source() -> str:
-    return repo_script_path("chatgpt-cdp-smoke.js").read_text(encoding="utf-8")
-
-
-def run_windows_cdp_chatgpt(
-    *,
-    payload_path: Path | None,
-    output_path: Path | None,
-    attachment_paths: Sequence[Path] | None,
-    project_url: str,
-    model_label: str,
-    model_strategy: str,
-    timeout_ms: int,
-    begin_marker: str | None,
-    end_marker: str | None,
-    debug_url: str | None,
-    marker_suffix: str,
-    prefer_new_page: bool = False,
-    prepare_only: bool = False,
-    inspect_existing_reviews_only: bool = False,
-    recover_existing_only: bool = False,
-) -> subprocess.CompletedProcess[bytes]:
-    return review_windows_mod.run_windows_cdp_chatgpt(
-        payload_path=payload_path,
-        output_path=output_path,
-        attachment_paths=attachment_paths,
-        project_url=project_url,
-        model_label=model_label,
-        model_strategy=model_strategy,
-        timeout_ms=timeout_ms,
-        begin_marker=begin_marker,
-        end_marker=end_marker,
-        debug_url=debug_url,
-        marker_suffix=marker_suffix,
-        windows_node=WINDOWS_NODE,
-        driver_source=_cdp_driver_source(),
-        detect_windows_cdp_debug_url_impl=detect_windows_cdp_debug_url,
-        write_windows_temp_file_impl=write_windows_temp_file,
-        to_windows_path_impl=to_windows_path,
-        subprocess_run=subprocess.run,
-        safe_unlink_impl=safe_unlink,
-        prefer_new_page=prefer_new_page,
-        prepare_only=prepare_only,
-        inspect_existing_reviews_only=inspect_existing_reviews_only,
-        recover_existing_only=recover_existing_only,
-    )
-
-
-def inspect_windows_cdp_reviews(*, project_url: str, debug_url: str | None, marker_suffix: str) -> dict[str, object]:
-    return review_windows_mod.inspect_windows_cdp_reviews(
-        project_url=project_url,
-        debug_url=debug_url,
-        marker_suffix=marker_suffix,
-        run_windows_cdp_chatgpt_impl=run_windows_cdp_chatgpt,
-        decode_windows_bytes_impl=decode_windows_bytes,
-    )
-
-
-def ensure_no_pending_windows_cdp_reviews(*, project_url: str, debug_url: str | None, marker_suffix: str) -> None:
-    review_windows_mod.ensure_no_pending_windows_cdp_reviews(
-        project_url=project_url,
-        debug_url=debug_url,
-        marker_suffix=marker_suffix,
-        inspect_windows_cdp_reviews_impl=inspect_windows_cdp_reviews,
-    )
-
-
-def recover_existing_windows_cdp_candidates(
-    *,
-    candidate_dir: Path,
-    project_url: str,
-    model_label: str,
-    timeout_ms: int,
-    debug_url: str | None,
-    marker_suffix: str,
-) -> list[ReviewCandidate]:
-    return review_windows_mod.recover_existing_windows_cdp_candidates(
-        candidate_dir=candidate_dir,
-        project_url=project_url,
-        model_label=model_label,
-        timeout_ms=timeout_ms,
-        debug_url=debug_url,
-        marker_suffix=marker_suffix,
-        parse_candidate_prompt_filename_impl=parse_candidate_prompt_filename,
-        parse_review_markers_impl=parse_review_markers,
-        windows_temp_path_impl=windows_temp_path,
-        run_windows_cdp_chatgpt_impl=run_windows_cdp_chatgpt,
-        decode_windows_bytes_impl=decode_windows_bytes,
-        safe_unlink_impl=safe_unlink,
-    )
-
-
-def prepare_windows_cdp_chatgpt(
-    *,
-    project_url: str,
-    model_label: str,
-    model_strategy: str,
-    debug_url: str | None,
-    marker_suffix: str,
-) -> None:
-    review_windows_mod.prepare_windows_cdp_chatgpt(
-        project_url=project_url,
-        model_label=model_label,
-        model_strategy=model_strategy,
-        debug_url=debug_url,
-        marker_suffix=marker_suffix,
-        run_windows_cdp_chatgpt_impl=run_windows_cdp_chatgpt,
-        decode_windows_bytes_impl=decode_windows_bytes,
-        sleep_impl=time.sleep,
-    )
-
-
-def run_windows_cdp_chatgpt_fanout(
-    *,
-    review_jobs: Sequence[tuple[int, str, str]],
-    attachment_paths: Sequence[Path] | None,
-    project_url: str,
-    model_label: str,
-    model_strategy: str,
-    timeout_ms: int,
-    debug_url: str | None,
-    marker_suffix: str,
-) -> list[ReviewCandidate]:
-    return review_windows_mod.run_windows_cdp_chatgpt_fanout(
-        review_jobs=review_jobs,
-        attachment_paths=attachment_paths,
-        project_url=project_url,
-        model_label=model_label,
-        model_strategy=model_strategy,
-        timeout_ms=timeout_ms,
-        debug_url=debug_url,
-        marker_suffix=marker_suffix,
-        windows_node=WINDOWS_NODE,
-        driver_source=_cdp_driver_source(),
-        detect_windows_cdp_debug_url_impl=detect_windows_cdp_debug_url,
-        prepare_windows_cdp_chatgpt_impl=prepare_windows_cdp_chatgpt,
-        write_windows_temp_file_impl=write_windows_temp_file,
-        windows_temp_path_impl=windows_temp_path,
-        to_windows_path_impl=to_windows_path,
-        subprocess_popen=subprocess.Popen,
-        decode_windows_bytes_impl=decode_windows_bytes,
-        safe_unlink_impl=safe_unlink,
-        terminate_process_impl=terminate_process,
-    )
-
-
-def copy_to_windows_clipboard(text: str) -> None:
-    review_windows_mod.copy_to_windows_clipboard(
-        text,
-        powershell_path=POWERSHELL_PATH,
-        write_windows_temp_file_impl=write_windows_temp_file,
-        to_windows_path_impl=to_windows_path,
-        subprocess_run=subprocess.run,
-    )
-
-
-def open_windows_browser(url: str) -> None:
-    review_windows_mod.open_windows_browser(url, subprocess_run=subprocess.run)
-
-
-def candidate_output_dir(write_output: Path) -> Path:
-    return review_artifacts_mod.candidate_output_dir(write_output)
-
-
-def reset_review_artifacts(write_output: Path, prompt_artifact: Path, candidate_dir: Path) -> None:
-    review_artifacts_mod.reset_review_artifacts(
-        write_output,
-        prompt_artifact,
-        candidate_dir,
-        safe_unlink_impl=safe_unlink,
-    )
-
-
-def write_candidate_artifacts(candidate_dir: Path, candidates: Sequence[ReviewCandidate], aggregate_meta: dict[str, object]) -> None:
-    review_artifacts_mod.write_candidate_artifacts(candidate_dir, candidates, aggregate_meta)
-
-
-def finalize_candidate_results(
-    *,
-    candidate_dir: Path,
-    write_output: Path,
-    candidate_results: Sequence[ReviewCandidate],
-    expected_count: int,
-) -> tuple[int, dict[str, object]]:
-    return review_artifacts_mod.finalize_candidate_results(
-        candidate_dir=candidate_dir,
-        write_output=write_output,
-        candidate_results=candidate_results,
-        expected_count=expected_count,
-        aggregate_review_candidates_impl=aggregate_review_candidates,
-        write_candidate_artifacts_impl=write_candidate_artifacts,
-    )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -510,7 +263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate_results=recovered_candidates,
                 expected_count=expected_recovered_count,
             )
-            cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
+            cleanup_paths([Path(temp_path) for temp_path in temp_paths])
             return completed_code
 
     reset_review_artifacts(write_output, prompt_artifact, candidate_dir)
@@ -580,19 +333,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"===== candidate {index:02d} [{label}] =====")
             print(bundle_text)
         if args.dry_run:
-            cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
+            cleanup_paths([Path(temp_path) for temp_path in temp_paths])
             return 0
 
     if args.delivery == "manual":
         if args.fanout_count > 1:
             print("Manual delivery does not support multi-review fanout. Use `--delivery cdp`.", file=sys.stderr)
-            cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
+            cleanup_paths([Path(temp_path) for temp_path in temp_paths])
             return 2
         copy_to_windows_clipboard(candidate_jobs[0][3])
         if not args.no_project_url:
             open_windows_browser(args.project_url)
         print_manual_help("" if args.no_project_url else args.project_url, prompt_artifact)
-        cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
+        cleanup_paths([Path(temp_path) for temp_path in temp_paths])
         return 0
 
     if args.delivery == "pinchtab" and args.model_strategy == "select":
@@ -600,11 +353,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Pinchtab delivery cannot automate ChatGPT model switching yet. Use `--delivery cdp` or set `--model-strategy current`.",
             file=sys.stderr,
         )
-        cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
+        cleanup_paths([Path(temp_path) for temp_path in temp_paths])
         return 2
     if args.delivery == "pinchtab" and args.fanout_count > 1:
         print("Pinchtab delivery does not support multi-review fanout. Use `--delivery cdp`.", file=sys.stderr)
-        cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
+        cleanup_paths([Path(temp_path) for temp_path in temp_paths])
         return 2
 
     completed_code = 0
@@ -702,7 +455,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_count=args.fanout_count,
         )
     finally:
-        cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
+        cleanup_paths([Path(temp_path) for temp_path in temp_paths])
 
     if completed_code != 0 and os.environ.get("WSL_DISTRO_NAME"):
         print_wsl_help()

@@ -490,7 +490,7 @@ class CDPReviewRunnerTests(unittest.TestCase):
                 output_path.write_text("{\"verdict\":\"pass\"}", encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout=b'{"recovered":true}', stderr=b"")
 
-            with patch.object(review, "run_windows_cdp_chatgpt", side_effect=fake_run_windows_cdp_chatgpt) as runner:
+            with patch.object(review.review_windows_mod, "run_windows_cdp_chatgpt", side_effect=fake_run_windows_cdp_chatgpt) as runner:
                 candidates = review.recover_existing_windows_cdp_candidates(
                     candidate_dir=candidate_dir,
                     project_url="https://chatgpt.com/g/project",
@@ -508,7 +508,7 @@ class CDPReviewRunnerTests(unittest.TestCase):
 
     def test_inspect_windows_cdp_reviews_uses_inspection_mode(self):
         with patch.object(
-            review,
+            review.review_windows_mod,
             "run_windows_cdp_chatgpt",
             return_value=SimpleNamespace(returncode=0, stdout=b'{"pendingReviews":[]}', stderr=b""),
         ) as run_windows_cdp_chatgpt:
@@ -521,13 +521,13 @@ class CDPReviewRunnerTests(unittest.TestCase):
         self.assertEqual(payload, {"pendingReviews": []})
         kwargs = run_windows_cdp_chatgpt.call_args.kwargs
         self.assertTrue(kwargs["inspect_existing_reviews_only"])
-        self.assertFalse(kwargs["prepare_only"])
-        self.assertFalse(kwargs["prefer_new_page"])
+        self.assertFalse(kwargs.get("prepare_only", False))
+        self.assertFalse(kwargs.get("prefer_new_page", False))
         self.assertEqual(kwargs["model_strategy"], "ignore")
 
     def test_ensure_no_pending_windows_cdp_reviews_raises_when_existing_tabs_are_incomplete(self):
         with patch.object(
-            review,
+            review.review_windows_mod,
             "inspect_windows_cdp_reviews",
             return_value={
                 "pendingReviews": [
@@ -568,10 +568,10 @@ class CDPReviewRunnerTests(unittest.TestCase):
                 self.assertEqual(config["attachmentPaths"], [str(attachment_path)])
                 return SimpleNamespace(returncode=0, stdout=b'{"ok":true}', stderr=b"")
 
-            with patch.object(review, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
-                review, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
-            ), patch.object(review, "to_windows_path", side_effect=lambda path: str(path)), patch.object(
-                review.subprocess, "run", side_effect=fake_run
+            with patch.object(review.review_windows_mod, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
+                review.review_windows_mod, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
+            ), patch.object(review.review_windows_mod, "to_windows_path", side_effect=lambda path: str(path)), patch.object(
+                review.review_windows_mod.subprocess, "run", side_effect=fake_run
             ):
                 completed = review.run_windows_cdp_chatgpt(
                     payload_path=payload_path,
@@ -660,11 +660,11 @@ class CDPReviewRunnerTests(unittest.TestCase):
                 processes.append(process)
                 return process
 
-            with patch.object(review, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
-                review, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
-            ), patch.object(review, "windows_temp_path", side_effect=fake_windows_temp_path), patch.object(
-                review, "to_windows_path", side_effect=lambda path: str(path)
-            ), patch.object(review.subprocess, "Popen", side_effect=fake_popen):
+            with patch.object(review.review_windows_mod, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
+                review.review_windows_mod, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
+            ), patch.object(review.review_windows_mod, "windows_temp_path", side_effect=fake_windows_temp_path), patch.object(
+                review.review_windows_mod, "to_windows_path", side_effect=lambda path: str(path)
+            ), patch.object(review.review_windows_mod.subprocess, "Popen", side_effect=fake_popen):
                 candidates = review.run_windows_cdp_chatgpt_fanout(
                     review_jobs=[
                         (1, "01-regression", "prompt-1"),
@@ -731,11 +731,11 @@ class CDPReviewRunnerTests(unittest.TestCase):
                 _ = stdout, stderr
                 return process
 
-            with patch.object(review, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
-                review, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
-            ), patch.object(review, "windows_temp_path", side_effect=fake_windows_temp_path), patch.object(
-                review, "to_windows_path", side_effect=lambda path: str(path)
-            ), patch.object(review.subprocess, "Popen", side_effect=fake_popen):
+            with patch.object(review.review_windows_mod, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
+                review.review_windows_mod, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
+            ), patch.object(review.review_windows_mod, "windows_temp_path", side_effect=fake_windows_temp_path), patch.object(
+                review.review_windows_mod, "to_windows_path", side_effect=lambda path: str(path)
+            ), patch.object(review.review_windows_mod.subprocess, "Popen", side_effect=fake_popen):
                 with self.assertRaisesRegex(RuntimeError, "boom"):
                     review.run_windows_cdp_chatgpt_fanout(
                         review_jobs=[(1, "01-regression", "prompt-1")],
@@ -752,6 +752,91 @@ class CDPReviewRunnerTests(unittest.TestCase):
                 process.calls,
                 ["communicate", "poll", "terminate", "wait:5", "kill", "wait:5"],
             )
+
+
+class ReviewMainTests(unittest.TestCase):
+    def test_main_single_cdp_review_falls_back_to_stdout_when_output_file_is_missing(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            base = Path(tempdir)
+            repo_root = base / "repo"
+            repo_root.mkdir(parents=True, exist_ok=True)
+            (repo_root / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            write_output = base / "review.json"
+
+            temp_index = {"value": 0}
+
+            def fake_create_temp_context(content: str) -> Path:
+                temp_index["value"] += 1
+                path = base / f"context-{temp_index['value']}.md"
+                path.write_text(content, encoding="utf-8")
+                return path
+
+            def fake_write_windows_temp_file(name: str, content: str) -> Path:
+                path = base / name
+                path.write_text(content, encoding="utf-8")
+                return path
+
+            def fake_run_windows_cdp_chatgpt(**_kwargs):
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "verdict": "pass",
+                            "summary": "문제 없음",
+                            "must_fix": [],
+                            "risks": [],
+                            "tests": [],
+                            "follow_up_prompt": "",
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8"),
+                    stderr=b"",
+                )
+
+            with patch.object(review, "detect_repo_root", return_value=repo_root), patch.object(
+                review, "detect_branch", return_value="main"
+            ), patch.object(review, "gather_changed_files", return_value=[]), patch.object(
+                review, "collect_review_git_paths", return_value=["app.py"]
+            ), patch.object(review, "gather_repo_snapshot_paths", return_value=["app.py"]), patch.object(
+                review, "build_diff_payload", return_value="# Diff\n"
+            ), patch.object(review, "create_temp_context", side_effect=fake_create_temp_context), patch.object(
+                review, "build_review_status_text", return_value=" M app.py"
+            ), patch.object(review, "build_review_diff_stat", return_value=" app.py | 1 +"), patch.object(
+                review, "build_context_markdown", return_value="# Context\n"
+            ), patch.object(review, "resolve_attachment_format", return_value="text"), patch.object(
+                review, "build_review_variants", return_value=[("01-regression", "prompt")]
+            ), patch.object(review, "build_bundle_text", return_value="bundle"), patch.object(
+                review, "ensure_no_pending_windows_cdp_reviews"
+            ), patch.object(review, "run_windows_cdp_chatgpt", side_effect=fake_run_windows_cdp_chatgpt), patch.object(
+                review, "write_windows_temp_file", side_effect=fake_write_windows_temp_file
+            ), patch.object(review, "windows_temp_path", return_value=base / "windows-output.md"), patch.object(
+                review.time, "sleep", return_value=None
+            ):
+                exit_code = review.main(
+                    [
+                        "--repo",
+                        str(repo_root),
+                        "--delivery",
+                        "cdp",
+                        "--mode",
+                        "diff",
+                        "--model",
+                        "ChatGPT 5.3 Instant",
+                        "--model-strategy",
+                        "current",
+                        "--fanout-count",
+                        "1",
+                        "--prompt",
+                        "테스트 프롬프트",
+                        "--write-output",
+                        str(write_output),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(write_output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["verdict"], "pass")
+            self.assertEqual(payload["summary"], "문제 없음")
 
 
 if __name__ == "__main__":

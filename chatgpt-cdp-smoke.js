@@ -76,6 +76,48 @@ async function main() {
     return "";
   }
 
+  function modelAliasesForLabel(value) {
+    const normalized = normalizeModelLabel(value);
+    const entries = [
+      [["5.3 instant", "instant 5.3", "gpt 5.3 instant"]],
+      [["5.4 thinking", "thinking 5.4", "gpt 5.4 thinking"]],
+      [["5.4 pro", "pro 5.4", "gpt 5.4 pro"]],
+    ];
+    for (const [aliases] of entries) {
+      if (aliases.includes(normalized)) {
+        return aliases;
+      }
+    }
+    return normalized ? [normalized] : [];
+  }
+
+  function escapeRegex(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  async function clickModelMenuItem(page, desiredLabel, modelTestId) {
+    if (modelTestId) {
+      const menuItem = page.getByTestId(modelTestId).first();
+      try {
+        await menuItem.waitFor({ timeout: 10000 });
+        await menuItem.click();
+        return;
+      } catch (_error) {
+      }
+    }
+
+    const aliases = modelAliasesForLabel(desiredLabel);
+    const pattern = aliases.length
+      ? new RegExp(aliases.map((alias) => escapeRegex(alias)).join("|"), "i")
+      : new RegExp(escapeRegex(desiredLabel), "i");
+    const fallback = page
+      .locator('[data-testid^="model-switcher-"], [role="option"], [role="menuitem"], button, div')
+      .filter({ hasText: pattern })
+      .first();
+    await fallback.waitFor({ timeout: 10000 });
+    await fallback.click();
+  }
+
   async function readCurrentModelText(page) {
     const button = page.getByTestId("model-switcher-dropdown-button").first();
     await button.waitFor({ timeout: 20000 });
@@ -113,9 +155,7 @@ async function main() {
 
     const button = page.getByTestId("model-switcher-dropdown-button").first();
     await button.click();
-    const menuItem = page.getByTestId(modelTestId).first();
-    await menuItem.waitFor({ timeout: 10000 });
-    await menuItem.click();
+    await clickModelMenuItem(page, desiredLabel, modelTestId);
 
     const deadline = Date.now() + 15000;
     while (Date.now() < deadline) {
@@ -148,6 +188,10 @@ async function main() {
       .trim();
   }
 
+  function stripPromptWhitespace(value) {
+    return normalizePromptText(value).replace(/\s+/g, "");
+  }
+
   async function readEditorText(editor) {
     const [innerText, textContent] = await Promise.all([
       editor.innerText().catch(() => ""),
@@ -157,7 +201,12 @@ async function main() {
   }
 
   function isPromptEquivalent(expected, actual) {
-    return normalizePromptText(expected) === normalizePromptText(actual);
+    const normalizedExpected = normalizePromptText(expected);
+    const normalizedActual = normalizePromptText(actual);
+    if (normalizedExpected === normalizedActual) {
+      return true;
+    }
+    return stripPromptWhitespace(normalizedExpected) === stripPromptWhitespace(normalizedActual);
   }
 
   async function attachmentNamesPresent(page, names) {
@@ -294,6 +343,17 @@ async function main() {
     }
     const answerEndIndex = body.indexOf(endMarker, answerBeginIndex + beginMarker.length);
     if (answerEndIndex < 0 || answerEndIndex <= answerBeginIndex) {
+      const fallbackEndIndex = body.indexOf(endMarker, promptBeginIndex + beginMarker.length);
+      if (fallbackEndIndex < 0 || fallbackEndIndex <= promptBeginIndex) {
+        return null;
+      }
+      const singlePairReview = body.slice(promptBeginIndex + beginMarker.length, fallbackEndIndex).trim();
+      if (!singlePairReview) {
+        return null;
+      }
+      if (/"verdict"\s*:/.test(singlePairReview) || singlePairReview.length >= 40) {
+        return singlePairReview;
+      }
       return null;
     }
     return body.slice(answerBeginIndex + beginMarker.length, answerEndIndex).trim();
@@ -328,7 +388,7 @@ async function main() {
         beginCount += count;
         const endMarker = marker.replace("BEGIN_CDX_REVIEW_", "END_CDX_REVIEW_");
         const endCountForMarker = markerCounts.get(endMarker) || 0;
-        if (count >= 2 && endCountForMarker >= 2) {
+        if (extractCompletedReview(body, marker, endMarker) !== null) {
           hasCompleteMarkers = true;
         } else if (count > 0 || endCountForMarker > 0) {
           hasPendingMarkers = true;

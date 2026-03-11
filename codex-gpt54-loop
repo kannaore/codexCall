@@ -39,6 +39,9 @@ review_command_path = loop_runtime_mod.review_command_path
 default_session_dir = loop_runtime_mod.default_session_dir
 write_text = loop_runtime_mod.write_text
 write_manifest = loop_runtime_mod.write_manifest
+codex_home_root = loop_runtime_mod.codex_home_root
+prepare_codex_home = loop_runtime_mod.prepare_codex_home
+build_codex_env = loop_runtime_mod.build_codex_env
 iter_status_entries = loop_git_mod.iter_status_entries
 is_reviewable_status_path = loop_git_mod.is_reviewable_status_path
 
@@ -71,6 +74,7 @@ def run_codex_round(
     prompt: str,
     session_dir: Path,
     args: argparse.Namespace,
+    codex_env: dict[str, str] | None = None,
 ) -> str:
     return loop_runtime_mod.run_codex_round(
         repo_root=repo_root,
@@ -79,6 +83,7 @@ def run_codex_round(
         prompt=prompt,
         session_dir=session_dir,
         args=args,
+        codex_env=codex_env,
         run_command_impl=run_command,
         write_text_impl=write_text,
         build_codex_command_impl=build_codex_command,
@@ -135,6 +140,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--codex-session-id", default=None, help="Resume an existing Codex session id instead of starting a new session.")
     parser.add_argument("--codex-resume-last", action="store_true", help="Resume the most recent recorded Codex session instead of starting a new session.")
+    parser.add_argument("--codex-shared-home", action="store_true", help="Use the shared global CODEX_HOME instead of an isolated per-loop Codex home.")
     parser.add_argument("--review-model", default=DEFAULT_REVIEW_MODEL, help="Visible ChatGPT model label.")
     parser.add_argument(
         "--review-model-strategy",
