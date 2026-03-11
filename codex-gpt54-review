@@ -5,7 +5,6 @@ import argparse
 from datetime import datetime
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -13,9 +12,11 @@ from pathlib import Path
 from typing import Sequence
 
 from oracle_review import aggregation as aggregation_mod
+from oracle_review import review_artifacts as review_artifacts_mod
 from oracle_review import bundles as bundles_mod
 from oracle_review import common as common_mod
 from oracle_review import repo_context as repo_context_mod
+from oracle_review import review_windows as review_windows_mod
 
 DEFAULT_PROMPT = common_mod.DEFAULT_PROMPT
 DEFAULT_PROJECT_URL = common_mod.DEFAULT_PROJECT_URL
@@ -87,100 +88,48 @@ resolve_attachment_format = bundles_mod.resolve_attachment_format
 snapshot_member_name = bundles_mod.snapshot_member_name
 create_repo_snapshot_archive = bundles_mod.create_repo_snapshot_archive
 build_bundle_text = bundles_mod.build_bundle_text
+cleanup_paths = review_artifacts_mod.cleanup_paths
+
+POWERSHELL_PATH = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 
 def write_windows_temp_file(name: str, content: str) -> Path:
-    WINDOWS_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    path = WINDOWS_TEMP_DIR / name
-    path.write_text(content, encoding="utf-8")
-    return path
+    return review_windows_mod.write_windows_temp_file(
+        name,
+        content,
+        windows_temp_dir=WINDOWS_TEMP_DIR,
+    )
 
 
 def windows_temp_path(name: str) -> Path:
-    WINDOWS_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    return WINDOWS_TEMP_DIR / name
+    return review_windows_mod.windows_temp_path(name, windows_temp_dir=WINDOWS_TEMP_DIR)
 
 
 def safe_unlink(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-        return
-    except FileNotFoundError:
-        return
-    except TypeError:
-        pass
-    except OSError:
-        return
-
-    try:
-        if path.exists():
-            path.unlink()
-    except (FileNotFoundError, OSError):
-        return
+    review_windows_mod.safe_unlink(path)
 
 
 def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 5) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        process.terminate()
-    except OSError:
-        return
-    try:
-        process.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    except OSError:
-        return
-
-    try:
-        process.kill()
-    except OSError:
-        return
-    try:
-        process.wait(timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError):
-        return
+    review_windows_mod.terminate_process(process, timeout=timeout)
 
 
 def to_windows_path(path: Path) -> str:
-    if os.environ.get("WSL_DISTRO_NAME"):
-        return run_command(["wslpath", "-m", str(path)], Path.cwd())
-    return str(path)
+    return review_windows_mod.to_windows_path(path, run_command_impl=run_command)
 
 
 def decode_windows_bytes(data: bytes) -> str:
-    for encoding in ("utf-8", "cp949", "utf-8-sig"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
+    return review_windows_mod.decode_windows_bytes(data)
 
 
 def run_windows_powershell(script_text: str, *, script_name: str) -> subprocess.CompletedProcess[bytes]:
-    ps_script = write_windows_temp_file(script_name, script_text)
-    ps = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-    try:
-        return subprocess.run(
-            [
-                ps,
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                to_windows_path(ps_script),
-            ],
-            check=False,
-            capture_output=True,
-        )
-    finally:
-        try:
-            ps_script.unlink(missing_ok=True)
-        except TypeError:
-            if ps_script.exists():
-                ps_script.unlink()
+    return review_windows_mod.run_windows_powershell(
+        script_text,
+        script_name=script_name,
+        powershell_path=POWERSHELL_PATH,
+        write_windows_temp_file_impl=write_windows_temp_file,
+        to_windows_path_impl=to_windows_path,
+        subprocess_run=subprocess.run,
+    )
 
 
 def run_windows_chatgpt(
@@ -194,84 +143,31 @@ def run_windows_chatgpt(
     begin_marker: str,
     end_marker: str,
 ) -> subprocess.CompletedProcess[bytes]:
-    ps_script = repo_script_path("chatgpt-windows-run.ps1")
-    ps = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-    command = [
-        ps,
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        str(ps_script),
-        "-PayloadPath",
-        to_windows_path(payload_path),
-        "-OutputPath",
-        to_windows_path(output_path),
-        "-ProjectUrl",
-        project_url,
-        "-ModelLabel",
-        model_label,
-        "-ModelStrategy",
-        model_strategy,
-        "-TimeoutMs",
-        str(timeout_ms),
-        "-BeginMarker",
-        begin_marker,
-        "-EndMarker",
-        end_marker,
-    ]
-    return subprocess.run(command, check=False, capture_output=True)
+    return review_windows_mod.run_windows_chatgpt(
+        payload_path=payload_path,
+        output_path=output_path,
+        project_url=project_url,
+        model_label=model_label,
+        model_strategy=model_strategy,
+        timeout_ms=timeout_ms,
+        begin_marker=begin_marker,
+        end_marker=end_marker,
+        powershell_path=POWERSHELL_PATH,
+        script_path=repo_script_path("chatgpt-windows-run.ps1"),
+        to_windows_path_impl=to_windows_path,
+        subprocess_run=subprocess.run,
+    )
 
 
 def detect_windows_cdp_debug_url() -> str:
-    completed = run_windows_powershell(
-        script_name="codex-chatgpt-detect-cdp.ps1",
-        script_text=r"""
-$sessionPath = Join-Path $env:LOCALAPPDATA 'CodexChatGPTRunner\pinchtab-session.json'
-$profileName = ''
-if (Test-Path $sessionPath) {
-  try {
-    $session = Get-Content -Raw $sessionPath | ConvertFrom-Json
-    $profileName = [string]$session.profileName
-  } catch {
-    $profileName = ''
-  }
-}
-
-$chrome = @(Get-CimInstance Win32_Process | Where-Object {
-  $_.Name -eq 'chrome.exe' -and $_.CommandLine -match '--remote-debugging-port=\d+'
-})
-
-if ($profileName) {
-  $escaped = [regex]::Escape($profileName)
-  foreach ($proc in $chrome) {
-    if ($proc.CommandLine -match $escaped -and $proc.CommandLine -match '--remote-debugging-port=(\d+)') {
-      Write-Output ('http://127.0.0.1:' + $Matches[1])
-      exit 0
-    }
-  }
-}
-
-foreach ($proc in $chrome) {
-  if ($proc.CommandLine -match '\\\.pinchtab\\profiles\\instance-' -and $proc.CommandLine -match '--remote-debugging-port=(\d+)') {
-    Write-Output ('http://127.0.0.1:' + $Matches[1])
-    exit 0
-  }
-}
-
-Write-Error 'Could not find an active Chrome remote-debugging port for the current Pinchtab ChatGPT session.'
-exit 1
-""",
+    return review_windows_mod.detect_windows_cdp_debug_url(
+        run_windows_powershell_impl=run_windows_powershell,
+        decode_windows_bytes_impl=decode_windows_bytes,
     )
-    if completed.returncode != 0:
-        stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
-        stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
-        raise RuntimeError((stderr_text or stdout_text or "Failed to detect Chrome debug URL.").strip())
-    stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
-    debug_url = stdout_text.strip()
-    if not debug_url:
-        raise RuntimeError("Chrome debug URL detection returned an empty result.")
-    return debug_url
+
+
+def _cdp_driver_source() -> str:
+    return repo_script_path("chatgpt-cdp-smoke.js").read_text(encoding="utf-8")
 
 
 def run_windows_cdp_chatgpt(
@@ -292,100 +188,48 @@ def run_windows_cdp_chatgpt(
     inspect_existing_reviews_only: bool = False,
     recover_existing_only: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
-    resolved_debug_url = debug_url or detect_windows_cdp_debug_url()
-    driver_source = repo_script_path("chatgpt-cdp-smoke.js").read_text(encoding="utf-8")
-    driver_path = write_windows_temp_file(f"chatgpt-cdp-driver-{marker_suffix}.js", driver_source)
-    payload: dict[str, object] = {
-        "debugUrl": resolved_debug_url,
-        "timeoutMs": timeout_ms,
-        "connectTimeoutMs": max(timeout_ms, 120000),
-        "projectUrl": project_url,
-        "modelLabel": model_label,
-        "modelStrategy": model_strategy,
-        "preferNewPage": prefer_new_page,
-        "prepareOnly": prepare_only,
-        "inspectExistingReviewsOnly": inspect_existing_reviews_only,
-        "recoverExistingOnly": recover_existing_only,
-    }
-    if payload_path is not None:
-        payload["payloadPath"] = to_windows_path(payload_path)
-    if output_path is not None:
-        payload["outputPath"] = to_windows_path(output_path)
-    if attachment_paths:
-        payload["attachmentPaths"] = [to_windows_path(path) for path in attachment_paths]
-    if begin_marker is not None:
-        payload["beginMarker"] = begin_marker
-    if end_marker is not None:
-        payload["endMarker"] = end_marker
-    config_payload = json.dumps(payload, ensure_ascii=False)
-    config_path = write_windows_temp_file(f"codex-chatgpt-cdp-{marker_suffix}.json", config_payload)
-    try:
-        return subprocess.run(
-            [
-                WINDOWS_NODE,
-                to_windows_path(driver_path),
-                to_windows_path(config_path),
-            ],
-            check=False,
-            capture_output=True,
-        )
-    finally:
-        safe_unlink(driver_path)
-        safe_unlink(config_path)
+    return review_windows_mod.run_windows_cdp_chatgpt(
+        payload_path=payload_path,
+        output_path=output_path,
+        attachment_paths=attachment_paths,
+        project_url=project_url,
+        model_label=model_label,
+        model_strategy=model_strategy,
+        timeout_ms=timeout_ms,
+        begin_marker=begin_marker,
+        end_marker=end_marker,
+        debug_url=debug_url,
+        marker_suffix=marker_suffix,
+        windows_node=WINDOWS_NODE,
+        driver_source=_cdp_driver_source(),
+        detect_windows_cdp_debug_url_impl=detect_windows_cdp_debug_url,
+        write_windows_temp_file_impl=write_windows_temp_file,
+        to_windows_path_impl=to_windows_path,
+        subprocess_run=subprocess.run,
+        safe_unlink_impl=safe_unlink,
+        prefer_new_page=prefer_new_page,
+        prepare_only=prepare_only,
+        inspect_existing_reviews_only=inspect_existing_reviews_only,
+        recover_existing_only=recover_existing_only,
+    )
 
 
 def inspect_windows_cdp_reviews(*, project_url: str, debug_url: str | None, marker_suffix: str) -> dict[str, object]:
-    completed = run_windows_cdp_chatgpt(
-        payload_path=None,
-        output_path=None,
-        attachment_paths=None,
-        project_url=project_url,
-        model_label="",
-        model_strategy="ignore",
-        timeout_ms=120000,
-        begin_marker=None,
-        end_marker=None,
-        debug_url=debug_url,
-        marker_suffix=f"{marker_suffix}-inspect",
-        prefer_new_page=False,
-        prepare_only=False,
-        inspect_existing_reviews_only=True,
-    )
-    stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
-    stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
-    if completed.returncode != 0:
-        raise RuntimeError((stderr_text or stdout_text or "Failed to inspect existing ChatGPT review tabs.").strip())
-    payload = {}
-    if stdout_text.strip():
-        try:
-            payload = json.loads(stdout_text.strip().splitlines()[-1])
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"Failed to parse existing review inspection output: {error}") from error
-    if not isinstance(payload, dict):
-        raise RuntimeError("Existing review inspection returned an invalid payload.")
-    return payload
-
-
-def ensure_no_pending_windows_cdp_reviews(*, project_url: str, debug_url: str | None, marker_suffix: str) -> None:
-    inspection = inspect_windows_cdp_reviews(
+    return review_windows_mod.inspect_windows_cdp_reviews(
         project_url=project_url,
         debug_url=debug_url,
         marker_suffix=marker_suffix,
+        run_windows_cdp_chatgpt_impl=run_windows_cdp_chatgpt,
+        decode_windows_bytes_impl=decode_windows_bytes,
     )
-    pending = inspection.get("pendingReviews", [])
-    if not isinstance(pending, list) or not pending:
-        return
-    pending_urls: list[str] = []
-    for entry in pending:
-        if isinstance(entry, dict):
-            url = str(entry.get("url", "")).strip()
-            state = str(entry.get("state", "")).strip()
-            pending_urls.append(f"{state or 'pending'}:{url}" if url else state or "pending")
-        else:
-            pending_urls.append(str(entry))
-    raise RuntimeError(
-        "Existing ChatGPT review tabs are still pending or incomplete. Wait for them to finish before starting a new review batch.\n"
-        + "\n".join(pending_urls[:10])
+
+
+def ensure_no_pending_windows_cdp_reviews(*, project_url: str, debug_url: str | None, marker_suffix: str) -> None:
+    review_windows_mod.ensure_no_pending_windows_cdp_reviews(
+        project_url=project_url,
+        debug_url=debug_url,
+        marker_suffix=marker_suffix,
+        inspect_windows_cdp_reviews_impl=inspect_windows_cdp_reviews,
     )
 
 
@@ -398,63 +242,20 @@ def recover_existing_windows_cdp_candidates(
     debug_url: str | None,
     marker_suffix: str,
 ) -> list[ReviewCandidate]:
-    prompt_paths = sorted(candidate_dir.glob("candidate-*.prompt.md"))
-    recovered: list[ReviewCandidate] = []
-    for prompt_path in prompt_paths:
-        try:
-            index, label = parse_candidate_prompt_filename(prompt_path)
-            bundle_text = prompt_path.read_text(encoding="utf-8")
-            begin_marker, end_marker = parse_review_markers(bundle_text)
-        except (OSError, ValueError):
-            continue
-        output_path = windows_temp_path(f"codex-chatgpt-recover-{marker_suffix}-{index:02d}.md")
-        try:
-            completed = run_windows_cdp_chatgpt(
-                payload_path=None,
-                output_path=output_path,
-                attachment_paths=None,
-                project_url=project_url,
-                model_label=model_label,
-                model_strategy="ignore",
-                timeout_ms=timeout_ms,
-                begin_marker=begin_marker,
-                end_marker=end_marker,
-                debug_url=debug_url,
-                marker_suffix=f"{marker_suffix}-recover-{index:02d}",
-                prefer_new_page=False,
-                prepare_only=False,
-                inspect_existing_reviews_only=False,
-                recover_existing_only=True,
-            )
-            stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
-            stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
-            review_text = ""
-            if output_path.exists() and output_path.stat().st_size > 0:
-                review_text = output_path.read_text(encoding="utf-8", errors="replace")
-            metadata: dict[str, object] = {}
-            if stdout_text.strip():
-                try:
-                    loaded = json.loads(stdout_text.strip().splitlines()[-1])
-                except json.JSONDecodeError:
-                    loaded = {}
-                if isinstance(loaded, dict):
-                    metadata = loaded
-            recovered.append(
-                ReviewCandidate(
-                    index=index,
-                    label=label,
-                    prompt_text=bundle_text,
-                    review_text=review_text or stdout_text.strip(),
-                    output_path=output_path,
-                    returncode=completed.returncode,
-                    stdout_text=stdout_text,
-                    stderr_text=stderr_text,
-                    metadata=metadata,
-                )
-            )
-        finally:
-            safe_unlink(output_path)
-    return recovered
+    return review_windows_mod.recover_existing_windows_cdp_candidates(
+        candidate_dir=candidate_dir,
+        project_url=project_url,
+        model_label=model_label,
+        timeout_ms=timeout_ms,
+        debug_url=debug_url,
+        marker_suffix=marker_suffix,
+        parse_candidate_prompt_filename_impl=parse_candidate_prompt_filename,
+        parse_review_markers_impl=parse_review_markers,
+        windows_temp_path_impl=windows_temp_path,
+        run_windows_cdp_chatgpt_impl=run_windows_cdp_chatgpt,
+        decode_windows_bytes_impl=decode_windows_bytes,
+        safe_unlink_impl=safe_unlink,
+    )
 
 
 def prepare_windows_cdp_chatgpt(
@@ -465,32 +266,16 @@ def prepare_windows_cdp_chatgpt(
     debug_url: str | None,
     marker_suffix: str,
 ) -> None:
-    last_error = ""
-    for attempt in range(1, 3):
-        completed = run_windows_cdp_chatgpt(
-            payload_path=None,
-            output_path=None,
-            attachment_paths=None,
-            project_url=project_url,
-            model_label=model_label,
-            model_strategy=model_strategy,
-            timeout_ms=180000,
-            begin_marker=None,
-            end_marker=None,
-            debug_url=debug_url,
-            marker_suffix=f"{marker_suffix}-prepare-{attempt}",
-            prefer_new_page=False,
-            prepare_only=True,
-        )
-        if completed.returncode == 0:
-            return
-        stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
-        stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
-        last_error = (stderr_text or stdout_text or "Failed to prepare ChatGPT project page.").strip()
-        if "connectOverCDP: Timeout" not in last_error or attempt == 2:
-            break
-        time.sleep(2)
-    raise RuntimeError(last_error or "Failed to prepare ChatGPT project page.")
+    review_windows_mod.prepare_windows_cdp_chatgpt(
+        project_url=project_url,
+        model_label=model_label,
+        model_strategy=model_strategy,
+        debug_url=debug_url,
+        marker_suffix=marker_suffix,
+        run_windows_cdp_chatgpt_impl=run_windows_cdp_chatgpt,
+        decode_windows_bytes_impl=decode_windows_bytes,
+        sleep_impl=time.sleep,
+    )
 
 
 def run_windows_cdp_chatgpt_fanout(
@@ -504,194 +289,58 @@ def run_windows_cdp_chatgpt_fanout(
     debug_url: str | None,
     marker_suffix: str,
 ) -> list[ReviewCandidate]:
-    resolved_debug_url = debug_url or detect_windows_cdp_debug_url()
-    effective_model_strategy = model_strategy
-    if model_strategy == "select":
-        prepare_windows_cdp_chatgpt(
-            project_url=project_url,
-            model_label=model_label,
-            model_strategy=model_strategy,
-            debug_url=resolved_debug_url,
-            marker_suffix=marker_suffix,
-        )
-        effective_model_strategy = "ignore"
-    driver_source = repo_script_path("chatgpt-cdp-smoke.js").read_text(encoding="utf-8")
-    driver_path = write_windows_temp_file(f"chatgpt-cdp-driver-{marker_suffix}.js", driver_source)
-    running: list[tuple[ReviewCandidate, subprocess.Popen[bytes], Path, Path]] = []
-    try:
-        for index, label, prompt_text in review_jobs:
-            begin_marker = f"BEGIN_CDX_REVIEW_{marker_suffix}_{index:02d}"
-            end_marker = f"END_CDX_REVIEW_{marker_suffix}_{index:02d}"
-            payload_path = write_windows_temp_file(
-                f"codex-chatgpt-payload-{marker_suffix}-{index:02d}.txt",
-                prompt_text,
-            )
-            output_path = windows_temp_path(f"codex-chatgpt-output-{marker_suffix}-{index:02d}.md")
-            config_payload = json.dumps(
-                {
-                    "debugUrl": resolved_debug_url,
-                    "payloadPath": to_windows_path(payload_path),
-                    "outputPath": to_windows_path(output_path),
-                    "attachmentPaths": [to_windows_path(path) for path in (attachment_paths or [])],
-                    "beginMarker": begin_marker,
-                    "endMarker": end_marker,
-                    "timeoutMs": timeout_ms,
-                    "projectUrl": project_url,
-                    "modelLabel": model_label,
-                    "modelStrategy": effective_model_strategy,
-                    "preferNewPage": True,
-                },
-                ensure_ascii=False,
-            )
-            config_path = write_windows_temp_file(
-                f"codex-chatgpt-cdp-{marker_suffix}-{index:02d}.json",
-                config_payload,
-            )
-            process = subprocess.Popen(
-                [
-                    WINDOWS_NODE,
-                    to_windows_path(driver_path),
-                    to_windows_path(config_path),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            candidate = ReviewCandidate(
-                index=index,
-                label=label,
-                prompt_text=prompt_text,
-                review_text="",
-                output_path=output_path,
-                returncode=-1,
-                stdout_text="",
-                stderr_text="",
-                metadata={},
-            )
-            running.append((candidate, process, payload_path, config_path))
-
-        completed_candidates: list[ReviewCandidate] = []
-        for candidate, process, payload_path, config_path in running:
-            stdout_bytes, stderr_bytes = process.communicate()
-            stdout_text = decode_windows_bytes(stdout_bytes) if stdout_bytes else ""
-            stderr_text = decode_windows_bytes(stderr_bytes) if stderr_bytes else ""
-            review_text = ""
-            if candidate.output_path.exists() and candidate.output_path.stat().st_size > 0:
-                review_text = candidate.output_path.read_text(encoding="utf-8", errors="replace")
-            metadata: dict[str, object] = {}
-            if stdout_text.strip():
-                try:
-                    loaded = json.loads(stdout_text.strip().splitlines()[-1])
-                except json.JSONDecodeError:
-                    loaded = {}
-                if isinstance(loaded, dict):
-                    metadata = loaded
-            completed_candidates.append(
-                ReviewCandidate(
-                    index=candidate.index,
-                    label=candidate.label,
-                    prompt_text=candidate.prompt_text,
-                    review_text=review_text or stdout_text.strip(),
-                    output_path=candidate.output_path,
-                    returncode=process.returncode or 0,
-                    stdout_text=stdout_text,
-                    stderr_text=stderr_text,
-                    metadata=metadata,
-                )
-            )
-            safe_unlink(payload_path)
-            safe_unlink(config_path)
-        return completed_candidates
-    finally:
-        for _candidate, process, payload_path, config_path in running:
-            terminate_process(process)
-            for temp_path in (payload_path, config_path):
-                safe_unlink(temp_path)
-        for candidate, _process, _payload_path, _config_path in running:
-            safe_unlink(candidate.output_path)
-        safe_unlink(driver_path)
+    return review_windows_mod.run_windows_cdp_chatgpt_fanout(
+        review_jobs=review_jobs,
+        attachment_paths=attachment_paths,
+        project_url=project_url,
+        model_label=model_label,
+        model_strategy=model_strategy,
+        timeout_ms=timeout_ms,
+        debug_url=debug_url,
+        marker_suffix=marker_suffix,
+        windows_node=WINDOWS_NODE,
+        driver_source=_cdp_driver_source(),
+        detect_windows_cdp_debug_url_impl=detect_windows_cdp_debug_url,
+        prepare_windows_cdp_chatgpt_impl=prepare_windows_cdp_chatgpt,
+        write_windows_temp_file_impl=write_windows_temp_file,
+        windows_temp_path_impl=windows_temp_path,
+        to_windows_path_impl=to_windows_path,
+        subprocess_popen=subprocess.Popen,
+        decode_windows_bytes_impl=decode_windows_bytes,
+        safe_unlink_impl=safe_unlink,
+        terminate_process_impl=terminate_process,
+    )
 
 
 def copy_to_windows_clipboard(text: str) -> None:
-    payload_path = write_windows_temp_file("codex-chatgpt-manual-payload.txt", text)
-    ps = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-    subprocess.run(
-        [
-            ps,
-            "-NoProfile",
-            "-Command",
-            f"Get-Content -Raw '{to_windows_path(payload_path)}' | Set-Clipboard",
-        ],
-        check=True,
-        capture_output=True,
+    review_windows_mod.copy_to_windows_clipboard(
+        text,
+        powershell_path=POWERSHELL_PATH,
+        write_windows_temp_file_impl=write_windows_temp_file,
+        to_windows_path_impl=to_windows_path,
+        subprocess_run=subprocess.run,
     )
 
 
 def open_windows_browser(url: str) -> None:
-    if not url:
-        return
-    subprocess.run(
-        [
-            "/mnt/c/Windows/System32/cmd.exe",
-            "/c",
-            "start",
-            "",
-            url,
-        ],
-        check=True,
-        capture_output=True,
-    )
+    review_windows_mod.open_windows_browser(url, subprocess_run=subprocess.run)
 
 
 def candidate_output_dir(write_output: Path) -> Path:
-    return write_output.parent / f"{write_output.name}.candidates"
+    return review_artifacts_mod.candidate_output_dir(write_output)
 
 
 def reset_review_artifacts(write_output: Path, prompt_artifact: Path, candidate_dir: Path) -> None:
-    for path in (write_output, prompt_artifact):
-        safe_unlink(path)
-    shutil.rmtree(candidate_dir, ignore_errors=True)
+    review_artifacts_mod.reset_review_artifacts(
+        write_output,
+        prompt_artifact,
+        candidate_dir,
+        safe_unlink_impl=safe_unlink,
+    )
 
 
 def write_candidate_artifacts(candidate_dir: Path, candidates: Sequence[ReviewCandidate], aggregate_meta: dict[str, object]) -> None:
-    candidate_dir.mkdir(parents=True, exist_ok=True)
-    manifest: dict[str, object] = {
-        "aggregate": aggregate_meta,
-        "candidates": [],
-    }
-    selected_entry: dict[str, object] | None = None
-    for candidate in candidates:
-        review_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.txt"
-        stdout_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.stdout.log"
-        stderr_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.stderr.log"
-        prompt_path = candidate_dir / f"candidate-{candidate.index:02d}-{candidate.label}.prompt.md"
-        review_path.write_text(candidate.review_text, encoding="utf-8")
-        stdout_path.write_text(candidate.stdout_text, encoding="utf-8")
-        stderr_path.write_text(candidate.stderr_text, encoding="utf-8")
-        entry = {
-            "index": candidate.index,
-            "label": candidate.label,
-            "returncode": candidate.returncode,
-            "prompt_path": str(prompt_path),
-            "review_path": str(review_path),
-            "stdout_path": str(stdout_path),
-            "stderr_path": str(stderr_path),
-            "metadata": candidate.metadata,
-        }
-        manifest["candidates"].append(entry)
-        if (
-            int(aggregate_meta.get("selected_candidate", -1)) == candidate.index
-            and str(aggregate_meta.get("selected_label", "")) == candidate.label
-        ):
-            selected_entry = entry
-    if selected_entry is not None:
-        manifest["aggregate"] = {
-            **aggregate_meta,
-            "selected_prompt_path": selected_entry["prompt_path"],
-            "selected_review_path": selected_entry["review_path"],
-            "selected_stdout_path": selected_entry["stdout_path"],
-            "selected_stderr_path": selected_entry["stderr_path"],
-        }
-    (candidate_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    review_artifacts_mod.write_candidate_artifacts(candidate_dir, candidates, aggregate_meta)
 
 
 def finalize_candidate_results(
@@ -701,42 +350,14 @@ def finalize_candidate_results(
     candidate_results: Sequence[ReviewCandidate],
     expected_count: int,
 ) -> tuple[int, dict[str, object]]:
-    successful_candidates = [candidate for candidate in candidate_results if candidate.returncode == 0 and candidate.review_text.strip()]
-    aggregate_meta: dict[str, object] = {}
-    completed_code = 0
-    if not successful_candidates:
-        completed_code = 1
-    else:
-        try:
-            aggregated_text, aggregate_meta = aggregate_review_candidates(
-                successful_candidates,
-                expected_count=expected_count,
-            )
-        except ValueError as error:
-            aggregate_meta = {
-                "mode": "aggregation-error",
-                "error": str(error),
-                "expected_candidate_count": expected_count,
-                "valid_candidate_count": len(successful_candidates),
-            }
-            print(str(error), file=sys.stderr)
-            completed_code = 1
-        else:
-            write_output.parent.mkdir(parents=True, exist_ok=True)
-            write_output.write_text(aggregated_text, encoding="utf-8")
-            completed_code = 0
-    write_candidate_artifacts(candidate_dir, candidate_results, aggregate_meta)
-    for candidate in candidate_results:
-        status = "ok" if candidate.returncode == 0 and candidate.review_text.strip() else f"failed({candidate.returncode})"
-        print(f"[candidate {candidate.index:02d}] {candidate.label}: {status}")
-        if candidate.stderr_text.strip():
-            print(candidate.stderr_text.strip(), file=sys.stderr)
-    if aggregate_meta:
-        print(
-            f"Selected review: candidate {int(aggregate_meta.get('selected_candidate', 0)):02d} "
-            f"[{aggregate_meta.get('selected_label', '')}] via {aggregate_meta.get('mode', '')}"
-        )
-    return completed_code, aggregate_meta
+    return review_artifacts_mod.finalize_candidate_results(
+        candidate_dir=candidate_dir,
+        write_output=write_output,
+        candidate_results=candidate_results,
+        expected_count=expected_count,
+        aggregate_review_candidates_impl=aggregate_review_candidates,
+        write_candidate_artifacts_impl=write_candidate_artifacts,
+    )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -889,8 +510,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate_results=recovered_candidates,
                 expected_count=expected_recovered_count,
             )
-            for temp_path in temp_paths:
-                safe_unlink(Path(temp_path))
+            cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
             return completed_code
 
     reset_review_artifacts(write_output, prompt_artifact, candidate_dir)
@@ -960,31 +580,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"===== candidate {index:02d} [{label}] =====")
             print(bundle_text)
         if args.dry_run:
-            for temp_path in temp_paths:
-                try:
-                    os.unlink(temp_path)
-                except FileNotFoundError:
-                    pass
+            cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
             return 0
 
     if args.delivery == "manual":
         if args.fanout_count > 1:
             print("Manual delivery does not support multi-review fanout. Use `--delivery cdp`.", file=sys.stderr)
-            for temp_path in temp_paths:
-                try:
-                    os.unlink(temp_path)
-                except FileNotFoundError:
-                    pass
+            cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
             return 2
         copy_to_windows_clipboard(candidate_jobs[0][3])
         if not args.no_project_url:
             open_windows_browser(args.project_url)
         print_manual_help("" if args.no_project_url else args.project_url, prompt_artifact)
-        for temp_path in temp_paths:
-            try:
-                os.unlink(temp_path)
-            except FileNotFoundError:
-                pass
+        cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
         return 0
 
     if args.delivery == "pinchtab" and args.model_strategy == "select":
@@ -992,19 +600,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Pinchtab delivery cannot automate ChatGPT model switching yet. Use `--delivery cdp` or set `--model-strategy current`.",
             file=sys.stderr,
         )
-        for temp_path in temp_paths:
-            try:
-                os.unlink(temp_path)
-            except FileNotFoundError:
-                pass
+        cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
         return 2
     if args.delivery == "pinchtab" and args.fanout_count > 1:
         print("Pinchtab delivery does not support multi-review fanout. Use `--delivery cdp`.", file=sys.stderr)
-        for temp_path in temp_paths:
-            try:
-                os.unlink(temp_path)
-            except FileNotFoundError:
-                pass
+        cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
         return 2
 
     completed_code = 0
@@ -1102,8 +702,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_count=args.fanout_count,
         )
     finally:
-        for temp_path in temp_paths:
-            safe_unlink(Path(temp_path))
+        cleanup_paths([Path(temp_path) for temp_path in temp_paths], safe_unlink_impl=safe_unlink)
 
     if completed_code != 0 and os.environ.get("WSL_DISTRO_NAME"):
         print_wsl_help()
