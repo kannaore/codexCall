@@ -64,6 +64,14 @@ class ParseReviewDecisionTests(unittest.TestCase):
             loop.parse_review_decision('{"verdict":"maybe"}')
 
 
+class TimeoutPolicyTests(unittest.TestCase):
+    def test_effective_review_timeout_ms_raises_54_pro_minimum_to_sixty_minutes(self):
+        self.assertEqual(loop.effective_review_timeout_ms("ChatGPT 5.4 Pro", 900000), 3600000)
+
+    def test_effective_review_timeout_ms_keeps_faster_models_requested_timeout(self):
+        self.assertEqual(loop.effective_review_timeout_ms("ChatGPT 5.3 Instant", 900000), 900000)
+
+
 class PromptFormattingTests(unittest.TestCase):
     def test_build_follow_up_prompt_skips_empty_sections(self):
         review = loop.ReviewDecision(

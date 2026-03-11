@@ -48,6 +48,103 @@ class ReviewVariantTests(unittest.TestCase):
         )
 
 
+class TimeoutPolicyTests(unittest.TestCase):
+    def test_effective_timeout_ms_raises_54_pro_minimum_to_sixty_minutes(self):
+        self.assertEqual(review.effective_timeout_ms("ChatGPT 5.4 Pro", 900000), 3600000)
+
+    def test_effective_timeout_ms_keeps_faster_models_requested_timeout(self):
+        self.assertEqual(review.effective_timeout_ms("ChatGPT 5.3 Instant", 900000), 900000)
+
+
+class DiffPayloadTests(unittest.TestCase):
+    def test_build_diff_payload_limits_git_commands_to_reviewable_files(self):
+        repo_root = Path("/tmp/repo")
+        seen_commands: list[list[str]] = []
+        rel_paths = ["codex-gpt54-review", "tests/test_codex_gpt54_review.py"]
+
+        def fake_run_command(args, cwd):
+            seen_commands.append(list(args))
+            command_key = tuple(args[:3])
+            if command_key == ("git", "status", "--short"):
+                return " M codex-gpt54-review\n M tests/test_codex_gpt54_review.py"
+            return "(none)"
+
+        with patch.object(review, "run_command", side_effect=fake_run_command):
+            payload = review.build_diff_payload(repo_root, rel_paths)
+
+        self.assertIn("codex-gpt54-review", payload)
+        self.assertIn("tests/test_codex_gpt54_review.py", payload)
+        self.assertEqual(
+            seen_commands,
+            [
+                ["git", "status", "--short", "--", "codex-gpt54-review", "tests/test_codex_gpt54_review.py"],
+                ["git", "diff", "--cached", "--find-renames", "HEAD", "--", "codex-gpt54-review", "tests/test_codex_gpt54_review.py"],
+                ["git", "diff", "--find-renames", "--", "codex-gpt54-review", "tests/test_codex_gpt54_review.py"],
+            ],
+        )
+
+    def test_build_diff_payload_reports_when_no_reviewable_files_changed(self):
+        with patch.object(review, "run_command") as run_command:
+            payload = review.build_diff_payload(Path("/tmp/repo"), [])
+
+        self.assertIn("(no reviewable changed files)", payload)
+        run_command.assert_not_called()
+
+    def test_build_review_status_and_diff_stat_use_reviewable_paths_only(self):
+        repo_root = Path("/tmp/repo")
+        seen_commands: list[list[str]] = []
+        rel_paths = ["codex-gpt54-review", "tests/test_codex_gpt54_review.py"]
+
+        def fake_run_command(args, cwd):
+            seen_commands.append(list(args))
+            return "ok"
+
+        with patch.object(review, "run_command", side_effect=fake_run_command):
+            status_text = review.build_review_status_text(repo_root, rel_paths)
+            diff_stat = review.build_review_diff_stat(repo_root, rel_paths)
+
+        self.assertEqual(status_text, "ok")
+        self.assertEqual(diff_stat, "ok")
+        self.assertEqual(
+            seen_commands,
+            [
+                ["git", "status", "--short", "--", "codex-gpt54-review", "tests/test_codex_gpt54_review.py"],
+                ["git", "diff", "--stat", "HEAD", "--", "codex-gpt54-review", "tests/test_codex_gpt54_review.py"],
+            ],
+        )
+
+    def test_collect_review_git_paths_keeps_deletes_and_filters_internal_artifacts(self):
+        repo_root = Path("/tmp/repo")
+        with patch.object(
+            review,
+            "gather_changed_git_paths",
+            return_value=["app.py", "old.py", ".oracle-reviews/manifest.json", "__pycache__/x.pyc"],
+        ):
+            rel_paths = review.collect_review_git_paths(
+                repo_root,
+                selected_files=[repo_root / "tests" / "test_app.py"],
+                include_changed_files=True,
+                include_untracked=True,
+            )
+
+        self.assertEqual(rel_paths, ["app.py", "old.py", "tests/test_app.py"])
+
+    def test_gather_repo_snapshot_paths_uses_tracked_and_untracked_files(self):
+        repo_root = Path("/tmp/repo")
+
+        def fake_run_command(args, cwd):
+            if args == ["git", "ls-files"]:
+                return "app.py\nREADME.md\n.oracle-reviews/manifest.json"
+            if args == ["git", "ls-files", "--others", "--exclude-standard"]:
+                return "notes.md\n__pycache__/junk.pyc"
+            raise AssertionError(args)
+
+        with patch.object(review, "run_command", side_effect=fake_run_command):
+            rel_paths = review.gather_repo_snapshot_paths(repo_root, include_untracked=True)
+
+        self.assertEqual(rel_paths, ["app.py", "README.md", "notes.md"])
+
+
 class ReviewAggregationTests(unittest.TestCase):
     def make_candidate(self, index: int, label: str, payload: dict[str, object]) -> object:
         return review.ReviewCandidate(
@@ -102,7 +199,7 @@ class ReviewAggregationTests(unittest.TestCase):
             ),
         ]
 
-        aggregated_text, metadata = review.aggregate_structured_candidates(candidates)
+        aggregated_text, metadata = review.aggregate_structured_candidates(candidates, expected_count=3)
         payload = json.loads(aggregated_text)
 
         self.assertEqual(payload["verdict"], "revise")
@@ -111,6 +208,7 @@ class ReviewAggregationTests(unittest.TestCase):
         self.assertEqual(payload["follow_up_prompt"], "timeout 실패 분기를 구현해라")
         self.assertEqual(metadata["mode"], "structured-consensus")
         self.assertEqual(metadata["selected_candidate"], 1)
+        self.assertEqual(metadata["required_valid_candidate_count"], 2)
 
     def test_aggregate_review_candidates_falls_back_to_best_plaintext(self):
         candidates = [
@@ -138,11 +236,97 @@ class ReviewAggregationTests(unittest.TestCase):
             ),
         ]
 
-        aggregated_text, metadata = review.aggregate_review_candidates(candidates)
+        aggregated_text, metadata = review.aggregate_review_candidates(candidates, expected_count=2)
 
         self.assertEqual(aggregated_text, "핵심 피드백\n리스크\n테스트 보강\n바로 고칠 것")
         self.assertEqual(metadata["selected_candidate"], 2)
         self.assertEqual(metadata["mode"], "best-text")
+
+    def test_aggregate_structured_candidates_requires_consensus_not_single_outlier(self):
+        candidates = [
+            self.make_candidate(
+                1,
+                "01-regression",
+                {
+                    "verdict": "revise",
+                    "summary": "예외 처리 누락",
+                    "must_fix": ["timeout 예외 처리 추가"],
+                    "risks": [],
+                    "tests": [],
+                    "follow_up_prompt": "timeout 실패 분기를 구현해라",
+                },
+            ),
+            self.make_candidate(
+                2,
+                "02-skeptic",
+                {
+                    "verdict": "pass",
+                    "summary": "치명적 문제는 안 보임",
+                    "must_fix": [],
+                    "risks": [],
+                    "tests": ["성공 경로 테스트"],
+                    "follow_up_prompt": "",
+                },
+            ),
+            self.make_candidate(
+                3,
+                "03-tests",
+                {
+                    "verdict": "pass",
+                    "summary": "치명적 문제는 안 보임",
+                    "must_fix": [],
+                    "risks": [],
+                    "tests": ["회귀 테스트 확인"],
+                    "follow_up_prompt": "",
+                },
+            ),
+        ]
+
+        aggregated_text, metadata = review.aggregate_structured_candidates(candidates, expected_count=3)
+        payload = json.loads(aggregated_text)
+
+        self.assertEqual(payload["verdict"], "pass")
+        self.assertEqual(payload["must_fix"], [])
+        self.assertEqual(metadata["pass_count"], 2)
+        self.assertEqual(metadata["revise_count"], 1)
+
+    def test_aggregate_structured_candidates_rejects_insufficient_valid_reviews(self):
+        candidates = [
+            self.make_candidate(
+                1,
+                "01-regression",
+                {
+                    "verdict": "pass",
+                    "summary": "ok",
+                    "must_fix": [],
+                    "risks": [],
+                    "tests": [],
+                    "follow_up_prompt": "",
+                },
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "at least 2 are required"):
+            review.aggregate_structured_candidates(candidates, expected_count=3)
+
+    def test_aggregate_review_candidates_does_not_fallback_to_plaintext_when_json_consensus_fails(self):
+        candidates = [
+            self.make_candidate(
+                1,
+                "01-regression",
+                {
+                    "verdict": "pass",
+                    "summary": "ok",
+                    "must_fix": [],
+                    "risks": [],
+                    "tests": [],
+                    "follow_up_prompt": "",
+                },
+            )
+        ]
+
+        with self.assertRaisesRegex(ValueError, "at least 2 are required"):
+            review.aggregate_review_candidates(candidates, expected_count=3)
 
 
 class ReviewArtifactResetTests(unittest.TestCase):
@@ -162,6 +346,57 @@ class ReviewArtifactResetTests(unittest.TestCase):
             self.assertFalse(write_output.exists())
             self.assertFalse(prompt_artifact.exists())
             self.assertFalse(candidate_dir.exists())
+
+
+class SnapshotArchiveTests(unittest.TestCase):
+    def test_resolve_attachment_format_prefers_repo_zip_for_large_inline_payloads(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            big_file = Path(tempdir) / "big.py"
+            big_file.write_text("x" * (review.SNAPSHOT_INLINE_CHAR_THRESHOLD + 1), encoding="utf-8")
+
+            attachment_format = review.resolve_attachment_format(
+                "auto",
+                delivery="cdp",
+                inline_attachments=[big_file],
+            )
+
+        self.assertEqual(attachment_format, "repo-zip")
+
+    def test_create_repo_snapshot_archive_includes_manifest_context_diff_and_repo_files(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo_root = Path(tempdir)
+            (repo_root / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (repo_root / "pkg").mkdir()
+            (repo_root / "pkg" / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+            archive_path = review.create_repo_snapshot_archive(
+                repo_root=repo_root,
+                branch="main",
+                prompt_text="리뷰해라",
+                context_text="# Context\n",
+                selected_files=[],
+                review_git_paths=["app.py", "deleted.py"],
+                repo_snapshot_paths=["app.py", "pkg/mod.py"],
+                status_text=" M app.py\n D deleted.py",
+                diff_stat=" app.py | 1 +",
+                diff_payload="# Diff\n",
+            )
+            try:
+                import zipfile
+
+                with zipfile.ZipFile(archive_path) as archive:
+                    names = set(archive.namelist())
+                    self.assertIn("README.md", names)
+                    self.assertIn("manifest.json", names)
+                    self.assertIn("context/review-context.md", names)
+                    self.assertIn("context/git-diff.md", names)
+                    self.assertIn("repo/app.py", names)
+                    self.assertIn("repo/pkg/mod.py", names)
+                    manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+                    self.assertEqual(manifest["deleted_paths"], ["deleted.py"])
+                    self.assertEqual(manifest["repo_snapshot_paths"], ["app.py", "pkg/mod.py"])
+            finally:
+                archive_path.unlink(missing_ok=True)
 
 
 class CleanupHelperTests(unittest.TestCase):
@@ -211,12 +446,51 @@ class CleanupHelperTests(unittest.TestCase):
 
 
 class CDPReviewRunnerTests(unittest.TestCase):
+    def test_inspect_windows_cdp_reviews_uses_inspection_mode(self):
+        with patch.object(
+            review,
+            "run_windows_cdp_chatgpt",
+            return_value=SimpleNamespace(returncode=0, stdout=b'{"pendingReviews":[]}', stderr=b""),
+        ) as run_windows_cdp_chatgpt:
+            payload = review.inspect_windows_cdp_reviews(
+                project_url="https://chatgpt.com/g/project",
+                debug_url="http://127.0.0.1:9870",
+                marker_suffix="inspect",
+            )
+
+        self.assertEqual(payload, {"pendingReviews": []})
+        kwargs = run_windows_cdp_chatgpt.call_args.kwargs
+        self.assertTrue(kwargs["inspect_existing_reviews_only"])
+        self.assertFalse(kwargs["prepare_only"])
+        self.assertFalse(kwargs["prefer_new_page"])
+        self.assertEqual(kwargs["model_strategy"], "ignore")
+
+    def test_ensure_no_pending_windows_cdp_reviews_raises_when_existing_tabs_are_incomplete(self):
+        with patch.object(
+            review,
+            "inspect_windows_cdp_reviews",
+            return_value={
+                "pendingReviews": [
+                    {"state": "pending", "url": "https://chatgpt.com/g/project/c/1"},
+                    {"state": "incomplete", "url": "https://chatgpt.com/g/project/c/2"},
+                ]
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "still pending or incomplete"):
+                review.ensure_no_pending_windows_cdp_reviews(
+                    project_url="https://chatgpt.com/g/project",
+                    debug_url="http://127.0.0.1:9870",
+                    marker_suffix="inspect",
+                )
+
     def test_run_windows_cdp_chatgpt_cleans_driver_and_config_files(self):
         with tempfile.TemporaryDirectory() as tempdir:
             base = Path(tempdir)
             payload_path = base / "payload.txt"
             payload_path.write_text("prompt", encoding="utf-8")
             output_path = base / "output.md"
+            attachment_path = base / "repo.zip"
+            attachment_path.write_text("zip", encoding="utf-8")
             created_paths: list[Path] = []
 
             def fake_write_windows_temp_file(name: str, content: str) -> Path:
@@ -231,6 +505,7 @@ class CDPReviewRunnerTests(unittest.TestCase):
                 self.assertEqual(config["debugUrl"], "http://127.0.0.1:9870")
                 self.assertEqual(config["payloadPath"], str(payload_path))
                 self.assertEqual(config["outputPath"], str(output_path))
+                self.assertEqual(config["attachmentPaths"], [str(attachment_path)])
                 return SimpleNamespace(returncode=0, stdout=b'{"ok":true}', stderr=b"")
 
             with patch.object(review, "detect_windows_cdp_debug_url", return_value="http://127.0.0.1:9870"), patch.object(
@@ -241,6 +516,7 @@ class CDPReviewRunnerTests(unittest.TestCase):
                 completed = review.run_windows_cdp_chatgpt(
                     payload_path=payload_path,
                     output_path=output_path,
+                    attachment_paths=[attachment_path],
                     project_url="https://chatgpt.com/g/project",
                     model_label="ChatGPT 5.4 Pro",
                     model_strategy="select",
@@ -334,6 +610,7 @@ class CDPReviewRunnerTests(unittest.TestCase):
                         (1, "01-regression", "prompt-1"),
                         (2, "02-tests", "prompt-2"),
                     ],
+                    attachment_paths=[base / "snapshot.zip"],
                     project_url="https://chatgpt.com/g/project",
                     model_label="ChatGPT 5.4 Pro",
                     model_strategy="ignore",
@@ -402,6 +679,7 @@ class CDPReviewRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "boom"):
                     review.run_windows_cdp_chatgpt_fanout(
                         review_jobs=[(1, "01-regression", "prompt-1")],
+                        attachment_paths=[base / "snapshot.zip"],
                         project_url="https://chatgpt.com/g/project",
                         model_label="ChatGPT 5.4 Pro",
                         model_strategy="ignore",

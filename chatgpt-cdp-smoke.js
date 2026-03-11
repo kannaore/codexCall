@@ -28,6 +28,7 @@ async function main() {
     debugUrl,
     payloadPath,
     outputPath,
+    attachmentPaths = [],
     beginMarker,
     endMarker,
     timeoutMs = 120000,
@@ -37,16 +38,17 @@ async function main() {
     modelStrategy = "ignore",
     preferNewPage = false,
     prepareOnly = false,
+    inspectExistingReviewsOnly = false,
   } = config;
 
   if (!debugUrl) {
     throw new Error("Missing required config fields.");
   }
-  if (!prepareOnly && (!payloadPath || !outputPath || !beginMarker || !endMarker)) {
+  if (!prepareOnly && !inspectExistingReviewsOnly && (!payloadPath || !outputPath || !beginMarker || !endMarker)) {
     throw new Error("Missing required config fields.");
   }
 
-  const payload = prepareOnly ? "" : fs.readFileSync(payloadPath, "utf8");
+  const payload = prepareOnly || inspectExistingReviewsOnly ? "" : fs.readFileSync(payloadPath, "utf8");
   const playwright = loadPlaywright();
   const browser = await playwright.chromium.connectOverCDP(debugUrl, { timeout: connectTimeoutMs });
 
@@ -137,8 +139,230 @@ async function main() {
     }).catch(() => {});
   }
 
-  async function injectPrompt(page, editor, payloadText) {
-    await clearEditor(page, editor);
+  function normalizePromptText(value) {
+    return String(value || "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/\u200b/g, "")
+      .trim();
+  }
+
+  async function readEditorText(editor) {
+    const [innerText, textContent] = await Promise.all([
+      editor.innerText().catch(() => ""),
+      editor.evaluate((node) => node.textContent || "").catch(() => ""),
+    ]);
+    return { innerText, textContent };
+  }
+
+  function isPromptEquivalent(expected, actual) {
+    return normalizePromptText(expected) === normalizePromptText(actual);
+  }
+
+  async function attachmentNamesPresent(page, names) {
+    return await page.evaluate((expectedNames) => {
+      const composerRoot = document.querySelector("form") || document.body;
+      if (!(composerRoot instanceof HTMLElement)) {
+        return false;
+      }
+      const text = composerRoot.innerText || "";
+      return expectedNames.every((name) => text.includes(name));
+    }, names).catch(() => false);
+  }
+
+  function isImageOnlyInput(acceptValue) {
+    const value = String(acceptValue || "").trim().toLowerCase();
+    return !!value && value.split(",").every((entry) => entry.trim().startsWith("image/"));
+  }
+
+  async function waitForAttachmentNames(page, names, timeoutMs = 30000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (await attachmentNamesPresent(page, names)) {
+        return true;
+      }
+      await page.waitForTimeout(500);
+    }
+    return false;
+  }
+
+  async function clickAttachmentButton(page) {
+    const candidates = [
+      page.getByTestId("composer-plus-btn").first(),
+      page.locator('button[aria-label*="파일"]').first(),
+      page.locator('button[aria-label*="Add files"]').first(),
+      page.locator('button[aria-label*="첨부"]').first(),
+    ];
+    for (const candidate of candidates) {
+      try {
+        await candidate.waitFor({ timeout: 1000 });
+        await candidate.click();
+        await page.waitForTimeout(500);
+        return true;
+      } catch (_error) {
+        continue;
+      }
+    }
+    return false;
+  }
+
+  async function uploadAttachments(page, filePaths) {
+    if (!Array.isArray(filePaths) || !filePaths.length) {
+      return;
+    }
+    const resolvedPaths = filePaths.map((filePath) => path.resolve(String(filePath)));
+    for (const filePath of resolvedPaths) {
+      fs.accessSync(filePath, fs.constants.R_OK);
+    }
+    const names = resolvedPaths.map((filePath) => path.basename(filePath));
+    const attempts = [
+      async () => {},
+      async () => {
+        await clickAttachmentButton(page);
+      },
+    ];
+    let lastError = "";
+    for (const prepare of attempts) {
+      await prepare();
+      const inputs = page.locator('input[type="file"]');
+      const inputCount = await inputs.count().catch(() => 0);
+      for (let index = 0; index < inputCount; index += 1) {
+        const input = inputs.nth(index);
+        const accept = await input.getAttribute("accept").catch(() => "");
+        if (isImageOnlyInput(accept)) {
+          continue;
+        }
+        try {
+          await input.setInputFiles(resolvedPaths);
+          if (await waitForAttachmentNames(page, names)) {
+            return;
+          }
+          lastError = `Attachment upload did not surface file names in the composer: ${names.join(", ")}`;
+        } catch (error) {
+          lastError = `Attachment upload failed via input ${index}: ${String((error && error.message) || error)}`;
+        }
+      }
+    }
+    throw new Error(lastError || `Could not find a usable ChatGPT file input for: ${names.join(", ")}`);
+  }
+
+  function normalizeProjectScope(projectUrl) {
+    const value = String(projectUrl || "").replace(/\/+$/, "");
+    if (!value) {
+      return "";
+    }
+    if (value.endsWith("/project")) {
+      return value.slice(0, -"/project".length);
+    }
+    return value;
+  }
+
+  function pageMatchesProjectScope(pageUrl, projectUrl) {
+    const url = String(pageUrl || "");
+    if (!url.startsWith("https://chatgpt.com/")) {
+      return false;
+    }
+    const scope = normalizeProjectScope(projectUrl);
+    if (!scope) {
+      return true;
+    }
+    return url.startsWith(scope);
+  }
+
+  function isResponseGenerating(text) {
+    const body = String(text || "");
+    return [
+      "ChatGPT가 아직 응답을 생성 중입니다",
+      "ChatGPT is still generating a response",
+      "Pro 생각 중",
+      "Pro thinking",
+      "Thought for",
+      "스트리밍이 중지되었습니다. 메시지 완료를 기다리는 중입니다",
+    ].some((pattern) => body.includes(pattern));
+  }
+
+  function extractCompletedReview(text, beginMarker, endMarker) {
+    const body = String(text || "");
+    const promptBeginIndex = body.indexOf(beginMarker);
+    if (promptBeginIndex < 0) {
+      return null;
+    }
+    const answerBeginIndex = body.indexOf(beginMarker, promptBeginIndex + beginMarker.length);
+    if (answerBeginIndex < 0) {
+      return null;
+    }
+    const answerEndIndex = body.indexOf(endMarker, answerBeginIndex + beginMarker.length);
+    if (answerEndIndex < 0 || answerEndIndex <= answerBeginIndex) {
+      return null;
+    }
+    return body.slice(answerBeginIndex + beginMarker.length, answerEndIndex).trim();
+  }
+
+  function analyzeReviewMarkers(text, beginMarker, endMarker) {
+    const body = String(text || "");
+    const beginCount = beginMarker ? body.split(beginMarker).length - 1 : 0;
+    const endCount = endMarker ? body.split(endMarker).length - 1 : 0;
+    const review = beginMarker && endMarker ? extractCompletedReview(body, beginMarker, endMarker) : null;
+    return {
+      beginCount,
+      endCount,
+      review,
+      isGenerating: isResponseGenerating(body),
+    };
+  }
+
+  function analyzeExistingReviewPage(text) {
+    const body = String(text || "");
+    const markerCounts = new Map();
+    for (const match of body.matchAll(/\b(?:BEGIN|END)_CDX_REVIEW_[A-Za-z0-9_]+\b/g)) {
+      const marker = String(match[0] || "");
+      markerCounts.set(marker, (markerCounts.get(marker) || 0) + 1);
+    }
+    let beginCount = 0;
+    let endCount = 0;
+    let hasCompleteMarkers = false;
+    for (const [marker, count] of markerCounts.entries()) {
+      if (marker.startsWith("BEGIN_CDX_REVIEW_")) {
+        beginCount += count;
+        const endMarker = marker.replace("BEGIN_CDX_REVIEW_", "END_CDX_REVIEW_");
+        if (count >= 2 && (markerCounts.get(endMarker) || 0) >= 2) {
+          hasCompleteMarkers = true;
+        }
+      } else if (marker.startsWith("END_CDX_REVIEW_")) {
+        endCount += count;
+      }
+    }
+    const hasMarkers = beginCount > 0 || endCount > 0;
+    const isGenerating = isResponseGenerating(body);
+    let state = "none";
+    if (hasMarkers) {
+      if (hasCompleteMarkers) {
+        state = "complete";
+      } else if (isGenerating) {
+        state = "pending";
+      } else {
+        state = "incomplete";
+      }
+    }
+    return {
+      beginCount,
+      endCount,
+      hasMarkers,
+      hasCompleteMarkers,
+      isGenerating,
+      state,
+    };
+  }
+
+  async function injectPromptViaDom(editor, payloadText) {
+    await editor.evaluate((node, text) => {
+      node.textContent = text;
+      node.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+      node.dispatchEvent(new Event("change", { bubbles: true }));
+    }, payloadText);
+  }
+
+  async function injectPromptViaInsertText(page, payloadText) {
     const chunks = [];
     const chunkSize = 4000;
     for (let index = 0; index < payloadText.length; index += chunkSize) {
@@ -148,10 +372,39 @@ async function main() {
       await page.keyboard.insertText(chunk);
       await page.waitForTimeout(20);
     }
-    const editorText = await editor.innerText().catch(() => "");
-    if (!editorText || editorText.length < Math.min(payloadText.length, 200)) {
-      throw new Error(`Prompt injection appears incomplete. Expected ${payloadText.length} chars, saw ${editorText.length}.`);
+  }
+
+  async function injectPromptViaClipboard(page, editor, payloadText) {
+    await page.evaluate(async (text) => {
+      await navigator.clipboard.writeText(text);
+    }, payloadText);
+    await editor.click();
+    await page.keyboard.press("Control+V");
+    await page.waitForTimeout(1000);
+  }
+
+  async function injectPrompt(page, editor, payloadText) {
+    await clearEditor(page, editor);
+    const strategies = [
+      ["dom-set", async () => injectPromptViaDom(editor, payloadText)],
+      ["clipboard", async () => injectPromptViaClipboard(page, editor, payloadText)],
+      ["insert-text", async () => injectPromptViaInsertText(page, payloadText)],
+    ];
+    let lastError = "";
+    for (const [label, action] of strategies) {
+      await clearEditor(page, editor);
+      try {
+        await action();
+        const { innerText, textContent } = await readEditorText(editor);
+        if (isPromptEquivalent(payloadText, textContent) || isPromptEquivalent(payloadText, innerText)) {
+          return;
+        }
+        lastError = `Prompt injection mismatch after ${label}. Expected ${payloadText.length} chars, saw innerText=${innerText.length}, textContent=${textContent.length}.`;
+      } catch (error) {
+        lastError = `Prompt injection failed via ${label}: ${String((error && error.message) || error)}`;
+      }
     }
+    throw new Error(lastError || `Prompt injection appears incomplete. Expected ${payloadText.length} chars.`);
   }
 
   async function submitPrompt(page, editor) {
@@ -250,6 +503,39 @@ async function main() {
       title: page.isClosed() ? "(closed)" : undefined,
     }));
 
+    if (inspectExistingReviewsOnly) {
+      const reviewPages = [];
+      for (const candidate of pages) {
+        const url = candidate.url() || "";
+        if (!pageMatchesProjectScope(url, projectUrl)) {
+          continue;
+        }
+        const text = await candidate.locator("body").innerText().catch(() => "");
+        const markerState = analyzeExistingReviewPage(text);
+        if (!markerState.hasMarkers) {
+          continue;
+        }
+        reviewPages.push({
+          url,
+          state: markerState.state,
+          beginCount: markerState.beginCount,
+          endCount: markerState.endCount,
+          isGenerating: markerState.isGenerating,
+        });
+      }
+      console.log(
+        JSON.stringify({
+          ok: true,
+          inspected: true,
+          projectUrl,
+          pages: pageSummaries,
+          reviewPages,
+          pendingReviews: reviewPages.filter((entry) => entry.state !== "complete"),
+        }),
+      );
+      return;
+    }
+
     let page = null;
     let sourcePage = null;
     if (projectUrl) {
@@ -307,27 +593,30 @@ async function main() {
 
     const editor = page.locator("#prompt-textarea").first();
     await editor.waitFor({ timeout: 20000 });
+    await uploadAttachments(page, attachmentPaths);
     await injectPrompt(page, editor, payload);
     await submitPrompt(page, editor);
 
     const started = Date.now();
+    let lastMarkerState = {
+      beginCount: 0,
+      endCount: 0,
+      review: null,
+      isGenerating: false,
+    };
     while (Date.now() - started < timeoutMs) {
       const text = await page.locator("body").innerText().catch(() => "");
-      const beginCount = text.split(beginMarker).length - 1;
-      const endCount = text.split(endMarker).length - 1;
-      const beginIndex = text.lastIndexOf(beginMarker);
-      const endIndex = text.lastIndexOf(endMarker);
-      if (beginCount >= 2 && endCount >= 2 && beginIndex >= 0 && endIndex > beginIndex) {
-        const review = text.slice(beginIndex + beginMarker.length, endIndex).trim();
-        fs.writeFileSync(outputPath, review, "utf8");
+      lastMarkerState = analyzeReviewMarkers(text, beginMarker, endMarker);
+      if (lastMarkerState.review !== null) {
+        fs.writeFileSync(outputPath, lastMarkerState.review, "utf8");
         console.log(
           JSON.stringify({
             ok: true,
             url: page.url(),
             pages: pageSummaries,
             outputPath,
-            reviewLength: review.length,
-            reviewPreview: review.slice(0, 200),
+            reviewLength: lastMarkerState.review.length,
+            reviewPreview: lastMarkerState.review.slice(0, 200),
           }),
         );
         return;
@@ -335,6 +624,14 @@ async function main() {
       await page.waitForTimeout(2000);
     }
 
+    if (lastMarkerState.isGenerating) {
+      throw new Error(`Review is still generating without completion markers on ${page.url()}`);
+    }
+    if (lastMarkerState.beginCount > 0 || lastMarkerState.endCount > 0) {
+      throw new Error(
+        `Review finished without a complete marker pair on ${page.url()} (beginCount=${lastMarkerState.beginCount}, endCount=${lastMarkerState.endCount})`,
+      );
+    }
     throw new Error(`Timed out waiting for markers on ${page.url()}`);
   } finally {
     await browser.close();

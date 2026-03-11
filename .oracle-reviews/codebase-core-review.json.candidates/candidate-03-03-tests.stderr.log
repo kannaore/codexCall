@@ -1,0 +1,2 @@
+page.waitForTimeout: Target page, context or browser has been closed
+    at main (C:\Users\Administrator\AppData\Local\Temp\chatgpt-cdp-driver-20260311133035.js:387:18)

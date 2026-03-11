@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -37,11 +38,16 @@ DEFAULT_MODEL = "ChatGPT 5.4 Pro"
 DEFAULT_MODEL_STRATEGY = "select"
 DEFAULT_FANOUT_COUNT = 5
 DEFAULT_FANOUT_STRATEGY = "angled"
+DEFAULT_ATTACHMENT_FORMAT = "auto"
+DEFAULT_TIMEOUT_MS = 900000
+MIN_TIMEOUT_MS_54 = 1800000
+MIN_TIMEOUT_MS_54_PRO = 3600000
 WINDOWS_TEMP_DIR = Path("/mnt/c/Users/Administrator/AppData/Local/Temp")
 WINDOWS_RUNNER_DIR = Path("/mnt/c/Users/Administrator/AppData/Local/CodexChatGPTRunner")
 WINDOWS_NODE = "/mnt/c/Program Files/nodejs/node.exe"
 MAX_FILE_CHARS = 12000
 MAX_BUNDLE_CHARS = 100000
+SNAPSHOT_INLINE_CHAR_THRESHOLD = 30000
 
 REVIEW_ANGLE_PRESETS: list[tuple[str, str]] = [
     ("regression", "이번 답변은 핵심 버그와 동작 회귀 가능성을 가장 엄격하게 본다."),
@@ -157,6 +163,25 @@ def rank_text_items(values: list[list[str]], *, limit: int = 5) -> list[str]:
     return ranked[:limit]
 
 
+def consensus_threshold(count: int) -> int:
+    if count <= 1:
+        return 1
+    return max(2, (count + 1) // 2)
+
+
+def normalize_model_label(value: str) -> str:
+    return " ".join(str(value or "").lower().replace("chatgpt", "").split())
+
+
+def effective_timeout_ms(model_label: str, requested_timeout_ms: int) -> int:
+    normalized = normalize_model_label(model_label)
+    if "5.4 pro" in normalized:
+        return max(requested_timeout_ms, MIN_TIMEOUT_MS_54_PRO)
+    if "5.4" in normalized:
+        return max(requested_timeout_ms, MIN_TIMEOUT_MS_54)
+    return requested_timeout_ms
+
+
 def score_structured_payload(payload: dict[str, object]) -> tuple[int, int]:
     verdict = str(payload.get("verdict", "")).strip().lower()
     must_fix = ensure_text_list(payload.get("must_fix"))
@@ -186,7 +211,11 @@ def build_consensus_follow_up(must_fix: list[str], tests: list[str], anchor_prom
     return " ".join(parts).strip()
 
 
-def aggregate_structured_candidates(candidates: Sequence[ReviewCandidate]) -> tuple[str, dict[str, object]]:
+def aggregate_structured_candidates(
+    candidates: Sequence[ReviewCandidate],
+    *,
+    expected_count: int | None = None,
+) -> tuple[str, dict[str, object]]:
     parsed: list[tuple[ReviewCandidate, dict[str, object]]] = []
     for candidate in candidates:
         try:
@@ -201,15 +230,34 @@ def aggregate_structured_candidates(candidates: Sequence[ReviewCandidate]) -> tu
     if not parsed:
         raise ValueError("No valid structured review response was found.")
 
+    expected_total = expected_count or len(candidates)
+    required_valid_count = consensus_threshold(expected_total)
+    if len(parsed) < required_valid_count:
+        raise ValueError(
+            f"Only {len(parsed)} valid structured review responses were collected; at least {required_valid_count} are required."
+        )
+
     revise = [(candidate, payload) for candidate, payload in parsed if str(payload.get("verdict", "")).strip().lower() == "revise"]
-    anchor_source = revise if revise else parsed
+    passed = [(candidate, payload) for candidate, payload in parsed if str(payload.get("verdict", "")).strip().lower() == "pass"]
+    verdict_threshold = consensus_threshold(len(parsed))
+    if len(revise) >= verdict_threshold:
+        verdict = "revise"
+        consensus_source = revise
+    elif len(passed) >= verdict_threshold:
+        verdict = "pass"
+        consensus_source = passed
+    else:
+        raise ValueError(
+            f"Structured review verdicts did not reach consensus (pass={len(passed)}, revise={len(revise)}, valid={len(parsed)})."
+        )
+
+    anchor_source = consensus_source
     anchor_candidate, anchor_payload = max(anchor_source, key=lambda item: score_structured_payload(item[1]))
 
-    must_fix = rank_text_items([ensure_text_list(payload.get("must_fix")) for _candidate, payload in parsed])
-    risks = rank_text_items([ensure_text_list(payload.get("risks")) for _candidate, payload in parsed])
-    tests = rank_text_items([ensure_text_list(payload.get("tests")) for _candidate, payload in parsed])
+    must_fix = rank_text_items([ensure_text_list(payload.get("must_fix")) for _candidate, payload in consensus_source])
+    risks = rank_text_items([ensure_text_list(payload.get("risks")) for _candidate, payload in consensus_source])
+    tests = rank_text_items([ensure_text_list(payload.get("tests")) for _candidate, payload in consensus_source])
     follow_up_prompt = ""
-    verdict = "pass" if not revise else "revise"
     if verdict == "revise":
         follow_up_prompt = build_consensus_follow_up(
             must_fix,
@@ -235,7 +283,10 @@ def aggregate_structured_candidates(candidates: Sequence[ReviewCandidate]) -> tu
         "mode": "structured-consensus",
         "selected_candidate": anchor_candidate.index,
         "selected_label": anchor_candidate.label,
+        "expected_candidate_count": expected_total,
+        "required_valid_candidate_count": required_valid_count,
         "valid_candidate_count": len(parsed),
+        "pass_count": len(passed),
         "revise_count": len(revise),
     }
     return json.dumps(aggregated, ensure_ascii=False, indent=2) + "\n", metadata
@@ -251,26 +302,59 @@ def score_plaintext_review(text: str) -> tuple[int, int]:
     return score, len(body)
 
 
-def aggregate_plaintext_candidates(candidates: Sequence[ReviewCandidate]) -> tuple[str, dict[str, object]]:
+def aggregate_plaintext_candidates(
+    candidates: Sequence[ReviewCandidate],
+    *,
+    expected_count: int | None = None,
+) -> tuple[str, dict[str, object]]:
+    expected_total = expected_count or len(candidates)
+    required_valid_count = consensus_threshold(expected_total)
+    if len(candidates) < required_valid_count:
+        raise ValueError(f"Only {len(candidates)} plaintext review responses were collected; at least {required_valid_count} are required.")
     selected = max(candidates, key=lambda candidate: score_plaintext_review(candidate.review_text))
     metadata = {
         "mode": "best-text",
         "selected_candidate": selected.index,
         "selected_label": selected.label,
+        "expected_candidate_count": expected_total,
+        "required_valid_candidate_count": required_valid_count,
         "valid_candidate_count": len(candidates),
     }
     return selected.review_text, metadata
 
 
-def aggregate_review_candidates(candidates: Sequence[ReviewCandidate]) -> tuple[str, dict[str, object]]:
+def aggregate_review_candidates(
+    candidates: Sequence[ReviewCandidate],
+    *,
+    expected_count: int | None = None,
+) -> tuple[str, dict[str, object]]:
+    structured_count = 0
+    for candidate in candidates:
+        try:
+            payload = extract_json_object(candidate.review_text)
+        except ValueError:
+            continue
+        verdict = str(payload.get("verdict", "")).strip().lower()
+        if verdict in {"pass", "revise"}:
+            structured_count += 1
+    if structured_count:
+        return aggregate_structured_candidates(candidates, expected_count=expected_count)
     try:
-        return aggregate_structured_candidates(candidates)
+        return aggregate_plaintext_candidates(candidates, expected_count=expected_count)
     except ValueError:
-        return aggregate_plaintext_candidates(candidates)
+        raise
+
+
+def is_reviewable_relpath(rel_path: str) -> bool:
+    path = Path(rel_path)
+    if not rel_path or path.suffix == ".pyc":
+        return False
+    blocked_parts = {".git", "__pycache__", DEFAULT_OUTPUT_DIR}
+    return not any(part in blocked_parts for part in path.parts)
 
 
 def is_reviewable_path(path: Path) -> bool:
-    return path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+    return path.is_file() and "__pycache__" not in path.parts and DEFAULT_OUTPUT_DIR not in path.parts and path.suffix != ".pyc"
 
 
 def dedupe_paths(paths: Iterable[Path]) -> list[Path]:
@@ -286,6 +370,18 @@ def dedupe_paths(paths: Iterable[Path]) -> list[Path]:
     return selected
 
 
+def dedupe_rel_paths(paths: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    selected: list[str] = []
+    for rel_path in paths:
+        normalized = Path(rel_path).as_posix().strip()
+        if not normalized or normalized in seen or not is_reviewable_relpath(normalized):
+            continue
+        seen.add(normalized)
+        selected.append(normalized)
+    return selected
+
+
 def detect_repo_root(start: Path) -> Path:
     return Path(run_command(["git", "rev-parse", "--show-toplevel"], start))
 
@@ -294,25 +390,77 @@ def detect_branch(repo_root: Path) -> str:
     return run_command(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_root)
 
 
-def gather_changed_files(repo_root: Path, *, include_untracked: bool) -> list[Path]:
-    staged = split_non_empty(run_command(["git", "diff", "--name-only", "--cached", "--diff-filter=ACMR"], repo_root))
-    unstaged = split_non_empty(run_command(["git", "diff", "--name-only", "--diff-filter=ACMR"], repo_root))
-    selected = [repo_root / path for path in [*staged, *unstaged]]
+def repo_relative_path(repo_root: Path, path: Path) -> str | None:
+    try:
+        return Path(path.resolve().relative_to(repo_root)).as_posix()
+    except ValueError:
+        return None
+
+
+def gather_changed_git_paths(repo_root: Path, *, include_untracked: bool) -> list[str]:
+    staged = split_non_empty(run_command(["git", "diff", "--name-only", "--cached", "--diff-filter=ACMRTUXD"], repo_root))
+    unstaged = split_non_empty(run_command(["git", "diff", "--name-only", "--diff-filter=ACMRTUXD"], repo_root))
+    rel_paths = [*staged, *unstaged]
     if include_untracked:
-        untracked = split_non_empty(run_command(["git", "ls-files", "--others", "--exclude-standard"], repo_root))
-        selected.extend(repo_root / path for path in untracked)
-    return dedupe_paths(selected)
+        rel_paths.extend(split_non_empty(run_command(["git", "ls-files", "--others", "--exclude-standard"], repo_root)))
+    return dedupe_rel_paths(rel_paths)
 
 
-def build_diff_payload(repo_root: Path) -> str:
-    status_text = run_command(["git", "status", "--short"], repo_root)
-    staged_diff = run_command(["git", "diff", "--cached", "--find-renames", "--binary", "HEAD"], repo_root)
-    unstaged_diff = run_command(["git", "diff", "--find-renames", "--binary"], repo_root)
+def gather_changed_files(repo_root: Path, *, include_untracked: bool) -> list[Path]:
+    return dedupe_paths(repo_root / rel_path for rel_path in gather_changed_git_paths(repo_root, include_untracked=include_untracked))
+
+
+def collect_review_git_paths(
+    repo_root: Path,
+    *,
+    selected_files: Sequence[Path],
+    include_changed_files: bool,
+    include_untracked: bool,
+) -> list[str]:
+    rel_paths: list[str] = []
+    if include_changed_files:
+        rel_paths.extend(gather_changed_git_paths(repo_root, include_untracked=include_untracked))
+    for path in selected_files:
+        rel_path = repo_relative_path(repo_root, path)
+        if rel_path:
+            rel_paths.append(rel_path)
+    return dedupe_rel_paths(rel_paths)
+
+
+def gather_repo_snapshot_paths(repo_root: Path, *, include_untracked: bool) -> list[str]:
+    tracked = split_non_empty(run_command(["git", "ls-files"], repo_root))
+    rel_paths = tracked
+    if include_untracked:
+        rel_paths = [*tracked, *split_non_empty(run_command(["git", "ls-files", "--others", "--exclude-standard"], repo_root))]
+    return dedupe_rel_paths(rel_paths)
+
+
+def build_review_status_text(repo_root: Path, rel_paths: Sequence[str]) -> str:
+    if not rel_paths:
+        return ""
+    return run_command(["git", "status", "--short", "--", *rel_paths], repo_root)
+
+
+def build_review_diff_stat(repo_root: Path, rel_paths: Sequence[str]) -> str:
+    if not rel_paths:
+        return ""
+    return run_command(["git", "diff", "--stat", "HEAD", "--", *rel_paths], repo_root)
+
+
+def build_diff_payload(repo_root: Path, rel_paths: Sequence[str]) -> str:
+    if rel_paths:
+        status_text = run_command(["git", "status", "--short", "--", *rel_paths], repo_root)
+        staged_diff = run_command(["git", "diff", "--cached", "--find-renames", "HEAD", "--", *rel_paths], repo_root)
+        unstaged_diff = run_command(["git", "diff", "--find-renames", "--", *rel_paths], repo_root)
+    else:
+        status_text = ""
+        staged_diff = ""
+        unstaged_diff = ""
     return (
         "# Git Diff Review Payload\n\n"
         "## Status\n"
         "```text\n"
-        f"{status_text or '(clean working tree)'}\n"
+        f"{status_text or '(no reviewable changed files)'}\n"
         "```\n\n"
         "## Staged Diff\n"
         "```diff\n"
@@ -331,6 +479,7 @@ def build_context_markdown(
     branch: str,
     prompt_text: str,
     selected_files: Sequence[Path],
+    review_git_paths: Sequence[str],
     status_text: str,
     diff_stat: str,
 ) -> str:
@@ -341,6 +490,7 @@ def build_context_markdown(
         except ValueError:
             rel_files.append(str(path))
     files_block = "\n".join(f"- {path}" for path in rel_files) or "- (none)"
+    git_scope_block = "\n".join(f"- {path}" for path in review_git_paths) or "- (none)"
     return f"""# Codex Review Context
 
 Repository: {repo_root.name}
@@ -352,6 +502,9 @@ Branch: {branch}
 
 ## Selected Files
 {files_block}
+
+## Git Review Scope
+{git_scope_block}
 
 ## Git Status
 ```text
@@ -388,12 +541,100 @@ def read_file_excerpt(path: Path) -> str:
     return text[:MAX_FILE_CHARS] + "\n\n[truncated]\n"
 
 
-def build_bundle_text(
+def estimate_inline_attachment_chars(paths: Sequence[Path]) -> int:
+    total = 0
+    for path in paths:
+        try:
+            total += min(path.stat().st_size, MAX_FILE_CHARS)
+        except OSError:
+            total += MAX_FILE_CHARS
+    return total
+
+
+def resolve_attachment_format(
+    requested_format: str,
+    *,
+    delivery: str,
+    inline_attachments: Sequence[Path],
+) -> str:
+    if requested_format != "auto":
+        return requested_format
+    if delivery != "cdp":
+        return "text"
+    return "repo-zip"
+
+
+def snapshot_member_name(repo_root: Path, path: Path) -> str:
+    rel_path = repo_relative_path(repo_root, path)
+    if rel_path:
+        return f"repo/{rel_path}"
+    return f"external/{path.name}"
+
+
+def create_repo_snapshot_archive(
     *,
     repo_root: Path,
+    branch: str,
+    prompt_text: str,
+    context_text: str,
+    selected_files: Sequence[Path],
+    review_git_paths: Sequence[str],
+    repo_snapshot_paths: Sequence[str],
+    status_text: str,
+    diff_stat: str,
+    diff_payload: str,
+) -> Path:
+    handle = tempfile.NamedTemporaryFile("wb", suffix=".review-snapshot.zip", delete=False)
+    try:
+        handle.close()
+        archive_path = Path(handle.name)
+        deleted_paths = [rel_path for rel_path in review_git_paths if not (repo_root / rel_path).exists()]
+        manifest = {
+            "repository": repo_root.name,
+            "path": str(repo_root),
+            "branch": branch,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "review_prompt": prompt_text.strip(),
+            "review_git_paths": list(review_git_paths),
+            "repo_snapshot_paths": list(repo_snapshot_paths),
+            "deleted_paths": deleted_paths,
+            "status_text": status_text,
+            "diff_stat": diff_stat,
+        }
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "README.md",
+                (
+                    "# Codex Review Snapshot\n\n"
+                    "이 압축 파일은 리뷰 시점의 전체 코드베이스 스냅샷과 git 컨텍스트를 담고 있습니다.\n\n"
+                    "우선 `manifest.json`, `context/review-context.md`, `context/git-diff.md`를 보고,\n"
+                    "필요한 코드 파일은 `repo/` 아래에서 확인하세요.\n"
+                ),
+            )
+            archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+            archive.writestr("context/review-context.md", context_text)
+            archive.writestr("context/git-diff.md", diff_payload)
+            for rel_path in repo_snapshot_paths:
+                file_path = repo_root / rel_path
+                if file_path.is_file() and is_reviewable_path(file_path):
+                    archive.write(file_path, f"repo/{rel_path}")
+            for path in selected_files:
+                rel_path = repo_relative_path(repo_root, path)
+                if rel_path or not path.is_file() or not is_reviewable_path(path):
+                    continue
+                archive.write(path, f"external/{path.name}")
+        return archive_path
+    except Exception:
+        safe_unlink(Path(handle.name))
+        raise
+
+
+def build_bundle_text(
+    *,
     prompt_text: str,
     context_text: str,
     attachments: Sequence[Path],
+    uploaded_paths: Sequence[Path],
     begin_marker: str,
     end_marker: str,
 ) -> str:
@@ -406,18 +647,26 @@ def build_bundle_text(
         "",
         context_text.strip(),
         "",
-        "## Attached Material",
     ]
-    remaining = MAX_BUNDLE_CHARS
-    for attachment in attachments:
-        body = read_file_excerpt(attachment)
-        header = f"\n### {attachment.name}\n"
-        block = header + "```text\n" + body + "\n```\n"
-        if len(block) > remaining:
-            parts.append("\n[remaining attachments omitted due to bundle cap]\n")
-            break
-        parts.append(block)
-        remaining -= len(block)
+    if uploaded_paths:
+        parts.append("## Uploaded Files")
+        for attachment in uploaded_paths:
+            parts.append(f"- {attachment.name}")
+        parts.append("")
+        parts.append("Use the uploaded files directly. The zip contains the full repository snapshot for this review.")
+    if attachments:
+        parts.append("")
+        parts.append("## Attached Material")
+        remaining = MAX_BUNDLE_CHARS
+        for attachment in attachments:
+            body = read_file_excerpt(attachment)
+            header = f"\n### {attachment.name}\n"
+            block = header + "```text\n" + body + "\n```\n"
+            if len(block) > remaining:
+                parts.append("\n[remaining attachments omitted due to bundle cap]\n")
+                break
+            parts.append(block)
+            remaining -= len(block)
     parts.append("\n## Review Request\n")
     parts.append(prompt_text.strip())
     return "\n".join(parts)
@@ -612,6 +861,7 @@ def run_windows_cdp_chatgpt(
     *,
     payload_path: Path | None,
     output_path: Path | None,
+    attachment_paths: Sequence[Path] | None,
     project_url: str,
     model_label: str,
     model_strategy: str,
@@ -622,6 +872,7 @@ def run_windows_cdp_chatgpt(
     marker_suffix: str,
     prefer_new_page: bool = False,
     prepare_only: bool = False,
+    inspect_existing_reviews_only: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     resolved_debug_url = debug_url or detect_windows_cdp_debug_url()
     driver_source = Path("/home/mrcorp/Coding/Tools/호출기/chatgpt-cdp-smoke.js").read_text(encoding="utf-8")
@@ -635,11 +886,14 @@ def run_windows_cdp_chatgpt(
         "modelStrategy": model_strategy,
         "preferNewPage": prefer_new_page,
         "prepareOnly": prepare_only,
+        "inspectExistingReviewsOnly": inspect_existing_reviews_only,
     }
     if payload_path is not None:
         payload["payloadPath"] = to_windows_path(payload_path)
     if output_path is not None:
         payload["outputPath"] = to_windows_path(output_path)
+    if attachment_paths:
+        payload["attachmentPaths"] = [to_windows_path(path) for path in attachment_paths]
     if begin_marker is not None:
         payload["beginMarker"] = begin_marker
     if end_marker is not None:
@@ -661,6 +915,61 @@ def run_windows_cdp_chatgpt(
         safe_unlink(config_path)
 
 
+def inspect_windows_cdp_reviews(*, project_url: str, debug_url: str | None, marker_suffix: str) -> dict[str, object]:
+    completed = run_windows_cdp_chatgpt(
+        payload_path=None,
+        output_path=None,
+        attachment_paths=None,
+        project_url=project_url,
+        model_label="",
+        model_strategy="ignore",
+        timeout_ms=120000,
+        begin_marker=None,
+        end_marker=None,
+        debug_url=debug_url,
+        marker_suffix=f"{marker_suffix}-inspect",
+        prefer_new_page=False,
+        prepare_only=False,
+        inspect_existing_reviews_only=True,
+    )
+    stdout_text = decode_windows_bytes(completed.stdout) if completed.stdout else ""
+    stderr_text = decode_windows_bytes(completed.stderr) if completed.stderr else ""
+    if completed.returncode != 0:
+        raise RuntimeError((stderr_text or stdout_text or "Failed to inspect existing ChatGPT review tabs.").strip())
+    payload = {}
+    if stdout_text.strip():
+        try:
+            payload = json.loads(stdout_text.strip().splitlines()[-1])
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Failed to parse existing review inspection output: {error}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("Existing review inspection returned an invalid payload.")
+    return payload
+
+
+def ensure_no_pending_windows_cdp_reviews(*, project_url: str, debug_url: str | None, marker_suffix: str) -> None:
+    inspection = inspect_windows_cdp_reviews(
+        project_url=project_url,
+        debug_url=debug_url,
+        marker_suffix=marker_suffix,
+    )
+    pending = inspection.get("pendingReviews", [])
+    if not isinstance(pending, list) or not pending:
+        return
+    pending_urls: list[str] = []
+    for entry in pending:
+        if isinstance(entry, dict):
+            url = str(entry.get("url", "")).strip()
+            state = str(entry.get("state", "")).strip()
+            pending_urls.append(f"{state or 'pending'}:{url}" if url else state or "pending")
+        else:
+            pending_urls.append(str(entry))
+    raise RuntimeError(
+        "Existing ChatGPT review tabs are still pending or incomplete. Wait for them to finish before starting a new review batch.\n"
+        + "\n".join(pending_urls[:10])
+    )
+
+
 def prepare_windows_cdp_chatgpt(
     *,
     project_url: str,
@@ -674,6 +983,7 @@ def prepare_windows_cdp_chatgpt(
         completed = run_windows_cdp_chatgpt(
             payload_path=None,
             output_path=None,
+            attachment_paths=None,
             project_url=project_url,
             model_label=model_label,
             model_strategy=model_strategy,
@@ -699,6 +1009,7 @@ def prepare_windows_cdp_chatgpt(
 def run_windows_cdp_chatgpt_fanout(
     *,
     review_jobs: Sequence[tuple[int, str, str]],
+    attachment_paths: Sequence[Path] | None,
     project_url: str,
     model_label: str,
     model_strategy: str,
@@ -734,6 +1045,7 @@ def run_windows_cdp_chatgpt_fanout(
                     "debugUrl": resolved_debug_url,
                     "payloadPath": to_windows_path(payload_path),
                     "outputPath": to_windows_path(output_path),
+                    "attachmentPaths": [to_windows_path(path) for path in (attachment_paths or [])],
                     "beginMarker": begin_marker,
                     "endMarker": end_marker,
                     "timeoutMs": timeout_ms,
@@ -927,13 +1239,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--project-url", default=DEFAULT_PROJECT_URL, help="ChatGPT project URL for browser runs.")
     parser.add_argument("--no-project-url", action="store_true", help="Do not force a ChatGPT project URL.")
     parser.add_argument("--write-output", default=None, help="Save the final assistant message to this file.")
-    parser.add_argument("--timeout-ms", type=int, default=900000, help="Wait budget for the ChatGPT answer.")
+    parser.add_argument("--timeout-ms", type=int, default=DEFAULT_TIMEOUT_MS, help="Wait budget for the ChatGPT answer.")
+    parser.add_argument(
+        "--allow-concurrent-review-tabs",
+        action="store_true",
+        help="Do not block when existing ChatGPT review tabs in the same project are still pending.",
+    )
     parser.add_argument("--fanout-count", type=int, default=DEFAULT_FANOUT_COUNT, help="How many independent ChatGPT review tabs to run.")
     parser.add_argument(
         "--fanout-strategy",
         default=DEFAULT_FANOUT_STRATEGY,
         choices=["angled", "identical"],
         help="Whether the parallel review prompts should use different review lenses or the same prompt.",
+    )
+    parser.add_argument(
+        "--attachment-format",
+        default=DEFAULT_ATTACHMENT_FORMAT,
+        choices=["auto", "text", "repo-zip", "both"],
+        help="How to send repository context: inline text, full repo zip upload, or both.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview without sending.")
     parser.add_argument("--render", action="store_true", help="Render the assembled prompt bundle.")
@@ -973,30 +1296,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         selected_files.extend(gather_changed_files(repo_root, include_untracked=args.include_untracked))
     selected_files.extend(Path(path).resolve() for path in args.extra_files)
     selected_files = dedupe_paths(selected_files)
+    review_git_paths = collect_review_git_paths(
+        repo_root,
+        selected_files=selected_files,
+        include_changed_files=not args.no_changed_files,
+        include_untracked=args.include_untracked,
+    )
+    repo_snapshot_paths = gather_repo_snapshot_paths(repo_root, include_untracked=args.include_untracked)
 
-    attachments: list[Path] = []
+    inline_attachments: list[Path] = []
     temp_paths: list[Path] = []
+    diff_payload = build_diff_payload(repo_root, review_git_paths)
 
     if args.mode in {"diff", "hybrid"}:
-        diff_file = create_temp_context(build_diff_payload(repo_root))
-        attachments.append(diff_file)
+        diff_file = create_temp_context(diff_payload)
+        inline_attachments.append(diff_file)
         temp_paths.append(diff_file)
 
     if selected_files:
-        attachments.extend(selected_files)
+        inline_attachments.extend(selected_files)
 
-    if not attachments:
+    if not inline_attachments and not review_git_paths:
         print("No attachments selected. Modify tracked files first or pass --file <path>.", file=sys.stderr)
         return 1
 
-    status_text = run_command(["git", "status", "--short"], repo_root)
-    diff_stat = run_command(["git", "diff", "--stat", "HEAD"], repo_root)
+    status_text = build_review_status_text(repo_root, review_git_paths)
+    diff_stat = build_review_diff_stat(repo_root, review_git_paths)
     context_file = create_temp_context(
         build_context_markdown(
             repo_root=repo_root,
             branch=branch,
             prompt_text=args.prompt,
             selected_files=selected_files,
+            review_git_paths=review_git_paths,
             status_text=status_text,
             diff_stat=diff_stat,
         )
@@ -1008,6 +1340,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     prompt_artifact = write_output.with_suffix(".prompt.md")
     reset_review_artifacts(write_output, prompt_artifact, candidate_dir)
     marker_suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+    timeout_ms = effective_timeout_ms(args.model, args.timeout_ms)
+    attachment_format = resolve_attachment_format(
+        args.attachment_format,
+        delivery=args.delivery,
+        inline_attachments=inline_attachments,
+    )
+    uploaded_paths: list[Path] = []
+    if attachment_format in {"repo-zip", "both"}:
+        snapshot_path = create_repo_snapshot_archive(
+            repo_root=repo_root,
+            branch=branch,
+            prompt_text=args.prompt,
+            context_text=context_file.read_text(encoding="utf-8"),
+            selected_files=selected_files,
+            review_git_paths=review_git_paths,
+            repo_snapshot_paths=repo_snapshot_paths,
+            status_text=status_text,
+            diff_stat=diff_stat,
+            diff_payload=diff_payload,
+        )
+        temp_paths.append(snapshot_path)
+        uploaded_paths.append(snapshot_path)
+    if attachment_format not in {"text", "repo-zip", "both"}:
+        print(f"Unsupported attachment format: {attachment_format}", file=sys.stderr)
+        return 2
+    if args.delivery != "cdp" and uploaded_paths:
+        print("Uploaded repository snapshots currently require `--delivery cdp`.", file=sys.stderr)
+        return 2
+
     review_variants = build_review_variants(args.prompt, args.fanout_count, args.fanout_strategy)
     context_text = context_file.read_text(encoding="utf-8")
     candidate_jobs: list[tuple[int, str, str, str]] = []
@@ -1018,10 +1379,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         begin_marker = f"BEGIN_CDX_REVIEW_{marker_suffix}_{index:02d}"
         end_marker = f"END_CDX_REVIEW_{marker_suffix}_{index:02d}"
         bundle_text = build_bundle_text(
-            repo_root=repo_root,
             prompt_text=variant_prompt,
             context_text=context_text,
-            attachments=attachments,
+            attachments=inline_attachments if attachment_format in {"text", "both"} else [],
+            uploaded_paths=uploaded_paths,
             begin_marker=begin_marker,
             end_marker=end_marker,
         )
@@ -1031,7 +1392,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         candidate_jobs.append((index, label, variant_prompt, bundle_text))
 
     prompt_artifact.write_text(
-        "Parallel review prompt set\n\n" + "\n".join(prompt_index_lines) + "\n",
+        "Parallel review prompt set\n\n"
+        + f"Attachment format: {attachment_format}\n"
+        + ("\n".join(f"- uploaded: {path}" for path in uploaded_paths) + "\n" if uploaded_paths else "")
+        + "\n".join(prompt_index_lines)
+        + "\n",
         encoding="utf-8",
     )
 
@@ -1094,13 +1459,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidate_results: list[ReviewCandidate] = []
     try:
         project_url = "" if args.no_project_url else args.project_url
+        if args.delivery == "cdp" and not args.allow_concurrent_review_tabs:
+            ensure_no_pending_windows_cdp_reviews(
+                project_url=project_url,
+                debug_url=args.cdp_debug_url,
+                marker_suffix=marker_suffix,
+            )
         if args.delivery == "cdp" and args.fanout_count > 1:
             candidate_results = run_windows_cdp_chatgpt_fanout(
                 review_jobs=[(index, label, bundle_text) for index, label, _variant_prompt, bundle_text in candidate_jobs],
+                attachment_paths=uploaded_paths,
                 project_url=project_url,
                 model_label=args.model,
                 model_strategy=args.model_strategy,
-                timeout_ms=args.timeout_ms,
+                timeout_ms=timeout_ms,
                 debug_url=args.cdp_debug_url,
                 marker_suffix=marker_suffix,
             )
@@ -1113,10 +1485,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     completed = run_windows_cdp_chatgpt(
                         payload_path=payload_path,
                         output_path=windows_output_path,
+                        attachment_paths=uploaded_paths,
                         project_url=project_url,
                         model_label=args.model,
                         model_strategy=args.model_strategy,
-                        timeout_ms=args.timeout_ms,
+                        timeout_ms=timeout_ms,
                         begin_marker=f"BEGIN_CDX_REVIEW_{marker_suffix}_01",
                         end_marker=f"END_CDX_REVIEW_{marker_suffix}_01",
                         debug_url=args.cdp_debug_url,
@@ -1130,7 +1503,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         project_url=project_url,
                         model_label=args.model,
                         model_strategy=args.model_strategy,
-                        timeout_ms=args.timeout_ms,
+                        timeout_ms=timeout_ms,
                         begin_marker=f"BEGIN_CDX_REVIEW_{marker_suffix}_01",
                         end_marker=f"END_CDX_REVIEW_{marker_suffix}_01",
                     )
@@ -1173,10 +1546,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not successful_candidates:
             completed_code = 1
         else:
-            aggregated_text, aggregate_meta = aggregate_review_candidates(successful_candidates)
-            write_output.parent.mkdir(parents=True, exist_ok=True)
-            write_output.write_text(aggregated_text, encoding="utf-8")
-            completed_code = 0
+            try:
+                aggregated_text, aggregate_meta = aggregate_review_candidates(
+                    successful_candidates,
+                    expected_count=args.fanout_count,
+                )
+            except ValueError as error:
+                aggregate_meta = {
+                    "mode": "aggregation-error",
+                    "error": str(error),
+                    "expected_candidate_count": args.fanout_count,
+                    "valid_candidate_count": len(successful_candidates),
+                }
+                print(str(error), file=sys.stderr)
+                completed_code = 1
+            else:
+                write_output.parent.mkdir(parents=True, exist_ok=True)
+                write_output.write_text(aggregated_text, encoding="utf-8")
+                completed_code = 0
         write_candidate_artifacts(candidate_dir, candidate_results, aggregate_meta)
         for candidate in candidate_results:
             status = "ok" if candidate.returncode == 0 and candidate.review_text.strip() else f"failed({candidate.returncode})"

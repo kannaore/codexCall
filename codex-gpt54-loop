@@ -20,6 +20,8 @@ DEFAULT_REVIEW_MODE = "diff"
 DEFAULT_REVIEW_TIMEOUT_MS = 900000
 DEFAULT_REVIEW_FANOUT_COUNT = 5
 DEFAULT_REVIEW_FANOUT_STRATEGY = "angled"
+MIN_REVIEW_TIMEOUT_MS_54 = 1800000
+MIN_REVIEW_TIMEOUT_MS_54_PRO = 3600000
 
 
 @dataclass
@@ -71,6 +73,19 @@ def ensure_text_list(value: Any) -> list[str]:
         return []
     text = str(value).strip()
     return [text] if text else []
+
+
+def normalize_model_label(value: str) -> str:
+    return " ".join(str(value or "").lower().replace("chatgpt", "").split())
+
+
+def effective_review_timeout_ms(model_label: str, requested_timeout_ms: int) -> int:
+    normalized = normalize_model_label(model_label)
+    if "5.4 pro" in normalized:
+        return max(requested_timeout_ms, MIN_REVIEW_TIMEOUT_MS_54_PRO)
+    if "5.4" in normalized:
+        return max(requested_timeout_ms, MIN_REVIEW_TIMEOUT_MS_54)
+    return requested_timeout_ms
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -398,6 +413,7 @@ def run_review_round(
         review_mode = "hybrid"
         include_untracked = True
         print(f"[round {round_index}] untracked files detected; escalating review mode to hybrid with untracked files.")
+    review_timeout_ms = effective_review_timeout_ms(args.review_model, args.review_timeout_ms)
     command = [
         str(review_command_path()),
         "--repo",
@@ -415,7 +431,7 @@ def run_review_round(
         "--model-strategy",
         args.review_model_strategy,
         "--timeout-ms",
-        str(args.review_timeout_ms),
+        str(review_timeout_ms),
         "--fanout-count",
         str(args.review_fanout_count),
         "--fanout-strategy",
